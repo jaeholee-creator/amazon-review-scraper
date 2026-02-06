@@ -14,7 +14,9 @@ from config.settings import (
     DATA_DIR, 
     USER_AGENTS,
     AMAZON_BASE_URL,
-    LOGIN_URL
+    LOGIN_URL,
+    AMAZON_EMAIL,
+    AMAZON_PASSWORD
 )
 
 
@@ -43,17 +45,27 @@ class AmazonAuth:
         """
         self.playwright = await async_playwright().start()
         
-        # Launch browser (visible for first login)
+        has_cookies = os.path.exists(self.cookies_file)
+        
         self.browser = await self.playwright.chromium.launch(
-            headless=False,  # Visible for login
-            args=['--disable-blink-features=AutomationControlled']
+            headless=has_cookies,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox'
+            ]
         )
         
-        # Create context with random user agent
         context = await self.browser.new_context(
             user_agent=random.choice(USER_AGENTS),
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-US'
+            viewport={
+                'width': random.randint(1366, 1920),
+                'height': random.randint(768, 1080)
+            },
+            locale='en-US',
+            timezone_id='America/Los_Angeles',
+            geolocation={'longitude': -122.4194, 'latitude': 37.7749},
+            permissions=['geolocation']
         )
         
         # Try to load saved cookies
@@ -78,31 +90,85 @@ class AmazonAuth:
             except Exception as e:
                 print(f"⚠️ Failed to load cookies: {e}")
         
-        # Manual login required
-        print("\n" + "="*50)
-        print("🔐 AMAZON LOGIN REQUIRED")
-        print("="*50)
-        print("A browser window will open.")
-        print("Please log in to your Amazon account.")
-        print("The scraper will continue automatically after login.")
-        print("="*50 + "\n")
-        
-        page = await context.new_page()
-        await page.goto(LOGIN_URL)
-        
-        # Wait for user to complete login (max 5 minutes)
+    async def _auto_login(self, page) -> bool:
+        """
+        Automatically log in using email and password.
+        Returns True if successful, False otherwise.
+        """
         try:
-            # Wait until redirected to main page or product page
-            await page.wait_for_function(
-                """() => {
-                    return window.location.hostname === 'www.amazon.com' && 
-                           !window.location.pathname.includes('/ap/');
-                }""",
-                timeout=300000  # 5 minutes
-            )
-            print("✅ Login detected!")
+            print("🔐 Attempting automatic login...")
             
-            # Wait a bit for page to stabilize
+            # Go to login page
+            await page.goto(LOGIN_URL)
+            await page.wait_for_timeout(1000)
+            
+            # Check for CAPTCHA
+            html = await page.content()
+            if 'arkoselabs' in html or 'captcha' in html.lower():
+                print("❌ CAPTCHA detected - cannot auto-login")
+                return False
+            
+            # Fill email
+            try:
+                await page.fill('#ap_email', AMAZON_EMAIL, timeout=5000)
+            except:
+                print("❌ Email field not found")
+                return False
+            
+            # Click continue
+            try:
+                await page.click('#continue', timeout=5000)
+            except:
+                print("❌ Continue button not found")
+                return False
+            
+            await page.wait_for_timeout(1000)
+            
+            # Check for CAPTCHA again
+            html = await page.content()
+            if 'arkoselabs' in html or 'captcha' in html.lower():
+                print("❌ CAPTCHA detected after email - cannot auto-login")
+                return False
+            
+            # Fill password
+            try:
+                await page.fill('#ap_password', AMAZON_PASSWORD, timeout=5000)
+            except:
+                print("❌ Password field not found")
+                return False
+            
+            # Click sign in
+            try:
+                await page.click('#signInSubmit', timeout=5000)
+            except:
+                print("❌ Sign in button not found")
+                return False
+            
+            # Wait for login to complete
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        return window.location.hostname === 'www.amazon.com' && 
+                               !window.location.pathname.includes('/ap/');
+                    }""",
+                    timeout=15000
+                )
+                print("✅ Auto-login successful!")
+                return True
+            except:
+                print("❌ Login verification failed")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Auto-login error: {e}")
+            return False
+
+
+                # Try automatic login first
+        page = await context.new_page()
+        
+        if await self._auto_login(page):
+            # Auto-login successful
             await page.wait_for_timeout(2000)
             
             # Save cookies
@@ -113,10 +179,21 @@ class AmazonAuth:
             
             await page.close()
             return context
-            
-        except Exception as e:
-            print(f"❌ Login timeout or error: {e}")
-            raise
+        
+        # Auto-login failed, show error
+        print("\n" + "="*50)
+        print("❌ AUTOMATIC LOGIN FAILED")
+        print("="*50)
+        print("Possible reasons:")
+        print("  1. CAPTCHA detected (Amazon security)")
+        print("  2. Invalid credentials in .env file")
+        print("  3. Network error")
+        print("="*50)
+        print("\nPlease check your .env file and try again.")
+        print("="*50 + "\n")
+        
+        await page.close()
+        raise Exception("Auto-login failed - cannot proceed without manual intervention")
     
     async def _is_logged_in(self, page) -> bool:
         """Check if user is logged in by examining account link."""
