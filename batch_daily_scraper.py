@@ -110,8 +110,17 @@ def save_reviews_to_file(reviews: list, output_path: str, product_name: str, app
 async def main():
     test_mode = '--test' in sys.argv
 
+    # --limit N 옵션: 제품 수 제한
+    limit = None
+    if '--limit' in sys.argv:
+        idx = sys.argv.index('--limit')
+        if idx + 1 < len(sys.argv):
+            limit = int(sys.argv[idx + 1])
+
     products = load_products_from_csv()
     asin_list = list(products.keys())
+    if limit:
+        asin_list = asin_list[:limit]
     
     start_date, end_date = get_collection_date_range()
     date_range_str = get_collection_date_range_str()

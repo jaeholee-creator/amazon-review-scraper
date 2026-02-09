@@ -10,12 +10,14 @@ Amazon 제품 리뷰를 수집하는 Playwright + BeautifulSoup 기반 스크래
 
 ## 📋 기능
 
-- ✅ Amazon 자동 로그인 및 세션 관리
-- ✅ 날짜 기반 필터링 (최근 1개월)
-- ✅ 실시간 CSV 저장
-- ✅ 중단/재개 지원 (체크포인트)
+- ✅ Amazon 자동 로그인 및 세션 관리 (Firefox)
+- ✅ **CAPTCHA 자동 해결** (CapSolver API 통합)
+- ✅ 날짜 기반 필터링 (최근 2일 윈도우)
+- ✅ API 모드 + HTML 파싱 하이브리드
+- ✅ 실시간 CSV 저장 (점진적)
+- ✅ 중복 제거 (review_id 트래킹)
 - ✅ Rate Limiting (IP 차단 방지)
-- ✅ CAPTCHA 감지 및 자동 중단
+- ✅ Slack 알림 (일일 리포트)
 
 ## 📊 수집 데이터 필드
 
@@ -53,22 +55,61 @@ playwright install chromium
 
 ## 🚀 실행
 
+### 일일 스크래퍼 (권장)
+
 ```bash
-# 기본 실행 (최근 1개월 리뷰 수집)
-python main.py
+# 전체 제품 실행
+python3 api_daily_scraper.py
 
-# 테스트 모드 (처음 10 페이지만)
-python main.py --test
+# 테스트 모드 (10페이지만)
+python3 api_daily_scraper.py --test
 
-# 체크포인트 삭제하고 처음부터
-python main.py --clear
+# 3개 제품만 테스트
+python3 api_daily_scraper.py --limit 3 --test
 ```
 
-### 첫 실행 시
-1. 브라우저 창이 열립니다
-2. Amazon 계정으로 직접 로그인하세요
-3. 로그인 완료 후 자동으로 크롤링이 시작됩니다
-4. 세션 쿠키가 `data/cookies.json`에 저장됩니다 (다음 실행부터 자동 로그인)
+### 첫 실행 시 (쿠키 없음)
+
+**옵션 1: 수동 로그인 (무료)**
+```bash
+python3 manual_login.py
+# 브라우저 창에서 로그인 → CAPTCHA 풀기 → 완료
+# 쿠키 저장 후 자동 스크래퍼 실행 가능
+```
+
+**옵션 2: CAPTCHA 자동 해결 (유료) - Claude API** ⭐ 권장
+```bash
+# 1. Claude API 키 설정 (.env 파일)
+ANTHROPIC_API_KEY=sk-ant-api03-your-key
+
+# 2. 설정 테스트
+python3 test_claude_solver.py
+
+# 3. 자동 실행 (CAPTCHA 발생 시 Claude가 자동 해결)
+python3 api_daily_scraper.py
+```
+
+**장점**:
+- 🎯 모든 CAPTCHA 타입 지원 (FunCaptcha, 이미지 선택, 텍스트)
+- 🧠 Claude 비전 AI의 높은 정확도 (85-95%)
+- 💰 저렴한 비용 (~$0.02/월, 쿠키 재사용 시)
+- ⚡ 간단한 설정 (API 키만)
+
+자세한 설정: [CLAUDE_CAPTCHA.md](CLAUDE_CAPTCHA.md) 참고
+
+**옵션 3: 다른 CAPTCHA 서비스**
+- CapSolver (FunCaptcha 전용): [CAPTCHA_SETUP.md](CAPTCHA_SETUP.md)
+- 2Captcha (이미지 CAPTCHA): [CAPTCHA_SETUP.md](CAPTCHA_SETUP.md)
+
+### 구버전 스크래퍼
+
+```bash
+# 단일 제품 전체 수집
+python main.py --test
+
+# HTML 파싱 모드 (구버전)
+python batch_daily_scraper.py --test
+```
 
 ## 📁 출력 파일
 

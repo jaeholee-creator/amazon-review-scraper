@@ -42,3 +42,10 @@ data/scraper_state.json
 .idea/
 *.swp
 *.swo
+credentials.json
+token.json
+client_secrets.json
+
+# Debug files
+data/debug_*.png
+data/debug_*.html
