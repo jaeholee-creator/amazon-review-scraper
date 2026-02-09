@@ -298,27 +298,25 @@ class DailyReviewScraper:
                 return True
             
             new_reviews = []
-            past_target_date_count = 0  # 범위 밖 리뷰 카운트
-            
+
             for review in reviews:
                 review_date = review.get('date_parsed')
                 if not review_date:
                     continue
-                
+
                 review_date_only = review_date.date() if hasattr(review_date, 'date') else review_date
                 review_id = review.get('review_id', '')
-                
-                # 범위 밖의 리뷰는 스킵하되, 계속 순회
-                if review_date_only < self.start_date or review_date_only > self.end_date:
-                    past_target_date_count += 1
-                    # 연속으로 10개 이상 범위 밖 리뷰가 나오면 중단 (더 이상 범위 내 리뷰 없음)
-                    if past_target_date_count >= 10:
-                        self.reached_cutoff = True
-                        break
+
+                # 날짜 범위 체크 (sortBy=recent이므로 최신순)
+                if review_date_only < self.start_date:
+                    # 최신순 정렬이므로 start_date보다 이전이면 이후는 모두 범위 밖
+                    # 즉시 중단하고 다음 제품으로
+                    print(f"   📅 Date cutoff reached ({review_date_only} < {self.start_date}). Stopping.")
+                    self.reached_cutoff = True
+                    break
+                elif review_date_only > self.end_date:
+                    # 미래 날짜는 스킵하고 계속 (드물지만 가능)
                     continue
-                
-                # 범위 내 리뷰 발견 시 카운트 리셋
-                past_target_date_count = 0
                 
                 if review_id and review_id in self.collected_ids:
                     continue
