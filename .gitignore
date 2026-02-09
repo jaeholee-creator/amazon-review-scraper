@@ -49,3 +49,9 @@ client_secrets.json
 # Debug files
 data/debug_*.png
 data/debug_*.html
+
+# Biodance 데이터
+data/biodance/
+
+# 서비스 계정 키
+config/service-account.json

@@ -1,0 +1,41 @@
+name: Biodance Reviews Collection
+
+on:
+  schedule:
+    # 매일 KST 오전 9시 (UTC 0시)
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 수동 실행 허용
+
+jobs:
+  collect-biodance-reviews:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+
+      # 서비스 계정 JSON 생성 (GitHub Secret에서 복원)
+      - name: Create service account key
+        run: |
+          mkdir -p config
+          echo '${{ secrets.GOOGLE_SHEETS_SERVICE_ACCOUNT }}' > config/service-account.json
+
+      # 환경변수 설정
+      - name: Set environment variables
+        run: |
+          echo "GOOGLE_SHEETS_SPREADSHEET_ID=${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}" >> $GITHUB_ENV
+          echo "SAVE_LOCAL_FILES=false" >> $GITHUB_ENV
+
+      - name: Run Biodance Review Crawler
+        run: python scrapers/biodance/run_biodance_reviews.py
