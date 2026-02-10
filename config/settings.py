@@ -209,3 +209,32 @@ def get_shopee_collection_date_range():
     end_date = now
     start_date = now - timedelta(days=COLLECTION_WINDOW_DAYS)
     return start_date, end_date
+
+
+# =============================================================================
+# TIKTOK SHOP CONFIGURATION
+# =============================================================================
+TIKTOK_EMAIL = os.getenv('TIKTOK_EMAIL', '')
+TIKTOK_PASSWORD = os.getenv('TIKTOK_PASSWORD', '')
+
+# Gmail API (TikTok 인증 코드 자동 읽기용)
+TIKTOK_GMAIL_SERVICE_ACCOUNT = os.getenv('TIKTOK_GMAIL_SERVICE_ACCOUNT', 'credentials.json')
+TIKTOK_GMAIL_DELEGATED_USER = os.getenv('TIKTOK_GMAIL_DELEGATED_USER', '')
+
+TIKTOK_SPREADSHEET_ID = '1NVUVShv5tAveINA9DdB2D21z71L3tF0In5JVK6LYX9s'
+TIKTOK_SHEET_NAME = 'US_tiktok'
+TIKTOK_DATA_DIR = 'data/tiktok'
+
+
+def get_tiktok_collection_date_range():
+    """
+    TikTok Shop 리뷰 수집 날짜 범위.
+    US EST 기준, 최근 COLLECTION_WINDOW_DAYS일간 수집.
+
+    Returns: (start_date, end_date) as date objects
+    """
+    from datetime import date
+    now_est = datetime.now(US_EST)
+    end_date = now_est.date()
+    start_date = end_date - timedelta(days=COLLECTION_WINDOW_DAYS)
+    return start_date, end_date

@@ -36,6 +36,18 @@ logs/
 data/daily/
 data/backups/
 data/scraper_state.json
+data/scraper_state_uk.json
+
+# Cookies (all)
+data/cookies_*.json
+data/tiktok/tiktok_cookies.json
+
+# Scraped output data
+data/us/
+data/uk/
+data/tiktok/*.csv
+data/tiktok/*.json
+!data/tiktok/.gitkeep
 
 # IDE
 .vscode/
