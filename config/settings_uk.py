@@ -65,7 +65,7 @@ def get_reviews_url(asin: str, page: int = 1) -> str:
     - reviewerType=all_reviews: All reviewers
     - filterByStar=all_stars: All star ratings
     """
-    return f'{AMAZON_BASE_URL}/product-reviews/{asin}?pageNumber={page}&sortBy=recent&reviewerType=all_reviews&filterByStar=all_stars'
+    return f'{AMAZON_BASE_URL}/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?ie=UTF8&filterByStar=all_stars&reviewerType=all_reviews&sortBy=recent&pageNumber={page}'
 
 # =============================================================================
 # RATE LIMITING

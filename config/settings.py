@@ -87,15 +87,13 @@ def get_run_date_str():
 def get_reviews_url(asin: str, page: int = 1) -> str:
     """
     동적으로 ASIN별 리뷰 URL 생성
-    
+
     필터 설정:
     - sortBy=recent: 최신순 정렬
     - reviewerType=all_reviews: 모든 리뷰어
     - filterByStar=all_stars: 모든 별점
-    - filterByMediaType=all_content: 모든 미디어 타입 (텍스트, 이미지, 비디오)
-    - filterByLanguage=all_languages: 모든 언어
     """
-    return f'{AMAZON_BASE_URL}/product-reviews/{asin}?pageNumber={page}&sortBy=recent&reviewerType=all_reviews&filterByStar=all_stars&filterByMediaType=all_content&filterByLanguage=all_languages'
+    return f'{AMAZON_BASE_URL}/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?ie=UTF8&filterByStar=all_stars&reviewerType=all_reviews&sortBy=recent&pageNumber={page}'
 
 # =============================================================================
 # RATE LIMITING (Optimized for speed while avoiding detection)
