@@ -156,7 +156,7 @@ class ReviewParser:
             location = loc_match_kr.group(1).strip()
         
         # Try to parse date
-        # English format: "January 15, 2024"
+        # English format (US): "January 15, 2024"
         date_match = re.search(r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', date_text)
         if date_match:
             month_name = date_match.group(1).lower()
@@ -168,6 +168,20 @@ class ReviewParser:
                     date_parsed = datetime(year, month, day)
                 except:
                     pass
+
+        # English format (UK): "29 January 2026"
+        if not date_parsed:
+            date_match_uk = re.search(r'(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})', date_text)
+            if date_match_uk:
+                day = int(date_match_uk.group(1))
+                month_name = date_match_uk.group(2).lower()
+                year = int(date_match_uk.group(3))
+                month = self.MONTH_MAPPINGS.get(month_name)
+                if month:
+                    try:
+                        date_parsed = datetime(year, month, day)
+                    except:
+                        pass
         
         # Korean format: "2024년 1월 15일"
         date_match_kr = re.search(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일', date_text)
