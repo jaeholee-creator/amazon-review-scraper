@@ -34,8 +34,8 @@ class TikTokShopScraper:
         password: str,
         data_dir: str = "data/tiktok",
         headless: bool = True,
-        gmail_service_account_file: str = "",
-        gmail_delegated_user: str = "",
+        gmail_imap_email: str = "",
+        gmail_imap_app_password: str = "",
     ):
         """
         Args:
@@ -43,16 +43,15 @@ class TikTokShopScraper:
             password: 비밀번호
             data_dir: 데이터 저장 디렉토리 (쿠키, 로그 등)
             headless: 헤드리스 모드 여부
-            gmail_service_account_file: Gmail API Service Account JSON 파일 경로
-            gmail_delegated_user: Gmail Domain-Wide Delegation 대상 사용자 이메일
+            gmail_imap_email: Gmail IMAP 이메일 주소 (인증 코드 자동 읽기용)
+            gmail_imap_app_password: Gmail App Password (2FA 후 생성)
         """
         self.email = email
         self.password = password
         self.data_dir = data_dir
         self.headless = headless
-        self.cookies_file = os.path.join(data_dir, "tiktok_cookies.json")
-        self.gmail_service_account_file = gmail_service_account_file
-        self.gmail_delegated_user = gmail_delegated_user
+        self.gmail_imap_email = gmail_imap_email
+        self.gmail_imap_app_password = gmail_imap_app_password
 
         self._playwright = None
         self._browser = None
@@ -71,72 +70,76 @@ class TikTokShopScraper:
         logger.info("Playwright 브라우저 시작...")
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        )
 
-        # 컨텍스트 생성 (쿠키 포함)
-        self._context = await self._browser.new_context(
+        # 영구 브라우저 프로필 사용 (캡차 회피: 동일 브라우저로 인식)
+        profile_dir = os.path.join(self.data_dir, "browser_profile")
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            profile_dir,
+            headless=self.headless,
             viewport={"width": 1440, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
+                "Chrome/133.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
+            timezone_id="America/New_York",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+            ignore_default_args=["--enable-automation"],
         )
+        self._browser = None  # persistent context는 browser 객체 없음
 
-        # 저장된 쿠키 로드
-        await self._load_cookies()
+        # 스텔스: 자동화 흔적 제거
+        await self._context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = {
+                runtime: { onConnect: { addListener: function() {} } },
+                loadTimes: function() { return {} },
+                csi: function() { return {} },
+            };
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                ]
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+        """)
 
-        self._page = await self._context.new_page()
+        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
         # 로그인 시도
         logged_in = await self._ensure_logged_in()
-        if logged_in:
-            await self._save_cookies()
         return logged_in
 
     async def close(self):
         """브라우저 종료"""
-        if self._context:
-            await self._save_cookies()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        try:
+            if self._context:
+                await self._context.close()
+        except Exception as e:
+            logger.debug(f"브라우저 컨텍스트 종료 중 오류 (무시): {e}")
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception as e:
+            logger.debug(f"Playwright 종료 중 오류 (무시): {e}")
         logger.info("브라우저 종료 완료")
 
     # =========================================================================
-    # Cookie Management
+    # Cookie / Session Management
     # =========================================================================
-
-    async def _load_cookies(self):
-        """저장된 쿠키 로드"""
-        if not os.path.exists(self.cookies_file):
-            logger.info("저장된 쿠키 없음")
-            return
-
-        try:
-            with open(self.cookies_file, "r") as f:
-                cookies = json.load(f)
-            await self._context.add_cookies(cookies)
-            logger.info(f"쿠키 로드 완료 ({len(cookies)}개)")
-        except Exception as e:
-            logger.warning(f"쿠키 로드 실패: {e}")
-
-    async def _save_cookies(self):
-        """현재 쿠키 저장"""
-        try:
-            cookies = await self._context.cookies()
-            with open(self.cookies_file, "w") as f:
-                json.dump(cookies, f)
-            logger.info(f"쿠키 저장 완료 ({len(cookies)}개)")
-        except Exception as e:
-            logger.warning(f"쿠키 저장 실패: {e}")
+    # 영구 브라우저 프로필 사용 → 쿠키/localStorage/sessionStorage 자동 유지
+    # 별도 쿠키 파일 저장 불필요
 
     # =========================================================================
     # Login
@@ -146,22 +149,23 @@ class TikTokShopScraper:
         """로그인 상태 확인 및 필요시 로그인 수행"""
         page = self._page
 
-        # Rating 페이지로 이동 시도
+        # Rating 페이지로 이동하여 세션 확인
         logger.info("Seller Center 접속 시도...")
         await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
 
-        # SSO 리다이렉트 등 완료 대기 (최대 15초)
-        for _ in range(5):
-            await page.wait_for_timeout(3000)
+        # SSO 리다이렉트 완료 대기
+        await page.wait_for_timeout(5000)
+        for _ in range(4):
+            await page.wait_for_timeout(5000)
             if await self._is_logged_in():
                 logger.info("기존 세션으로 로그인 확인됨")
+                await self._dismiss_popups()
                 return True
-            # 로그인 페이지로 확실히 리다이렉트된 경우 즉시 중단
             current_url = page.url
-            if "/account/login" in current_url or "/account/signup" in current_url:
+            if "/account/login" in current_url or "/account/register" in current_url:
                 break
 
-        logger.info("로그인 필요. 로그인 진행...")
+        logger.info("세션 만료. 재로그인 진행...")
         return await self._do_login()
 
     async def _is_logged_in(self) -> bool:
@@ -169,8 +173,21 @@ class TikTokShopScraper:
         page = self._page
         current_url = page.url
 
-        # Seller Center 내부 페이지에 있으면 로그인 상태
-        if "seller-us.tiktok.com" in current_url and "/account/" not in current_url:
+        # 로그인/회원가입 페이지면 확실히 미로그인
+        if "/account/login" in current_url or "/account/register" in current_url:
+            return False
+
+        # 내부 페이지 URL 패턴이면 로그인 성공
+        logged_in_paths = ["/homepage", "/product/", "/order/", "/dashboard", "/finance/"]
+        for path in logged_in_paths:
+            if path in current_url:
+                return True
+
+        # seller-us.tiktok.com에 있지만 위 패턴이 아닌 경우 → 비밀번호 입력창으로 판단
+        if "seller-us.tiktok.com" in current_url:
+            password_input = await page.query_selector('input[type="password"]')
+            if password_input:
+                return False
             return True
 
         return False
@@ -184,11 +201,20 @@ class TikTokShopScraper:
             await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
-            # "Log in" 링크 클릭 (signup 페이지일 경우)
-            login_link = await page.query_selector('a[href*="login"], span:has-text("Log in")')
-            if login_link:
-                await login_link.click()
-                await page.wait_for_timeout(2000)
+            # "Log in" 탭으로 전환 (기본이 Sign up일 수 있음)
+            # 여러 셀렉터 시도
+            for selector in [
+                'a[href*="/account/login"]',
+                'div:has-text("Log in") >> nth=0',
+                'span:has-text("Log in")',
+                'button:has-text("Log in")',
+            ]:
+                login_tab = await page.query_selector(selector)
+                if login_tab:
+                    await login_tab.click()
+                    logger.info(f"Log in 탭 클릭: {selector}")
+                    await page.wait_for_timeout(2000)
+                    break
 
             # Email 탭 선택
             email_tab = await page.query_selector('[data-tid="emailTab"], [id*="email"]')
@@ -229,8 +255,28 @@ class TikTokShopScraper:
                 logger.error("로그인 버튼을 찾을 수 없음")
                 return False
 
-            # 이메일 인증 코드 처리 (최대 300초 대기)
+            # 로그인 버튼 클릭 후 캡차/인증 코드 대기
+            await page.wait_for_timeout(5000)
+            logger.info(f"로그인 버튼 클릭 후 URL: {page.url}")
+
+            # 캡차 처리 (슬라이더 퍼즐 캡차가 나타날 수 있음)
+            captcha_passed = await self._handle_captcha()
+
+            if not captcha_passed:
+                if not self.headless:
+                    # headed 모드: 수동 캡차 풀기 대기 (최대 60초)
+                    logger.info("캡차를 수동으로 풀어주세요 (최대 60초 대기)")
+                    for _ in range(12):
+                        await page.wait_for_timeout(5000)
+                        if await self._needs_verification() or await self._is_logged_in():
+                            break
+                else:
+                    logger.error("Headless 모드에서 캡차 자동 풀기 실패")
+                    return False
+
+            # 캡차 후 페이지 전환 대기
             await page.wait_for_timeout(3000)
+            logger.info(f"캡차 처리 후 URL: {page.url}")
 
             if await self._needs_verification():
                 logger.info("이메일 인증 코드 필요 - 대기 중...")
@@ -240,12 +286,24 @@ class TikTokShopScraper:
                     return False
 
             # 로그인 완료 대기 (SSO 리다이렉트 포함)
-            for _ in range(6):
+            for i in range(6):
                 await page.wait_for_timeout(3000)
+                current_url = page.url
+
+                # register 리다이렉트 감지 → Seller Center 메인으로 재이동
+                if "/account/register" in current_url:
+                    logger.info("register 리다이렉트 감지 - Seller Center 메인으로 재이동")
+                    await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
+                    if await self._is_logged_in():
+                        logger.info("로그인 성공! (register 리다이렉트 우회)")
+                        return True
+                    continue
+
                 if await self._is_logged_in():
                     logger.info("로그인 성공!")
                     return True
-                logger.info(f"  로그인 대기 중... URL: {page.url[:80]}")
+                logger.info(f"  로그인 대기 중... URL: {current_url[:80]}")
 
             # Rating 페이지로 직접 이동 시도
             await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
@@ -262,14 +320,133 @@ class TikTokShopScraper:
             logger.error(f"로그인 오류: {e}")
             return False
 
+    async def _handle_captcha(self) -> bool:
+        """캡차가 있으면 자동으로 풀기. 캡차가 남아있으면 False 반환."""
+        try:
+            from utils.captcha_solver import TikTokCaptchaSolver
+
+            solver = TikTokCaptchaSolver(self._page)
+
+            if not await solver.is_captcha_visible():
+                logger.info("캡차 없음 - 통과")
+                return True
+
+            logger.info("슬라이더 캡차 감지 - 자동 풀기 시도")
+            success = await solver.solve()
+
+            if success:
+                logger.info("캡차 자동 풀기 성공")
+                return True
+
+            # 솔버가 실패 보고했지만, 실제로 캡차가 사라졌을 수 있음
+            await self._page.wait_for_timeout(2000)
+            if not await solver.is_captcha_visible():
+                logger.info("캡차 자동 풀기 성공 (지연 확인)")
+                return True
+
+            logger.warning("캡차 자동 풀기 실패 - 캡차가 여전히 표시됨")
+            return False
+
+        except ImportError:
+            logger.warning("캡차 솔버 모듈 없음 (Pillow 설치 필요)")
+            return True  # 캡차 없을 수도 있으므로 진행
+        except Exception as e:
+            logger.warning(f"캡차 처리 중 오류: {e}")
+            return True
+
+    async def _dismiss_popups(self):
+        """공지사항, 알림, 모달 등의 팝업을 자동으로 닫기"""
+        page = self._page
+        try:
+            # 일반적인 닫기 버튼 패턴들
+            close_selectors = [
+                # 모달/다이얼로그 닫기 버튼
+                'button[aria-label="Close"]',
+                'button[aria-label="close"]',
+                '[class*="modal"] [class*="close"]',
+                '[class*="dialog"] [class*="close"]',
+                '[class*="announcement"] [class*="close"]',
+                '[class*="notice"] [class*="close"]',
+                '[class*="popup"] [class*="close"]',
+                # Arco Design 모달 닫기
+                '.arco-modal-close-icon',
+                '.arco-icon-close',
+                # TikTok 특유의 닫기 패턴
+                '[class*="CloseButton"]',
+                '[class*="closeBtn"]',
+                # 일반적인 "Got it", "OK", "I understand" 버튼
+                'button:has-text("Got it")',
+                'button:has-text("OK")',
+                'button:has-text("I understand")',
+                'button:has-text("Confirm")',
+                'button:has-text("Dismiss")',
+            ]
+
+            dismissed = 0
+            for selector in close_selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    for el in elements:
+                        if await el.is_visible():
+                            await el.click()
+                            dismissed += 1
+                            await page.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+            # 버튼으로 닫지 못한 경우 ESC 키 시도 (Arco Design 모달은 ESC로 닫힘)
+            if dismissed == 0:
+                # 모달/오버레이가 있는지 확인
+                modal = await page.query_selector(
+                    '.arco-modal-wrapper, [class*="modal"], [class*="dialog"], '
+                    '[class*="announcement"], [class*="popup"]'
+                )
+                if modal and await modal.is_visible():
+                    await page.keyboard.press("Escape")
+                    dismissed += 1
+                    await page.wait_for_timeout(500)
+
+            if dismissed > 0:
+                logger.info(f"팝업/모달 {dismissed}개 닫음")
+                await page.wait_for_timeout(1000)
+
+        except Exception as e:
+            logger.debug(f"팝업 닫기 중 오류 (무시): {e}")
+
     async def _needs_verification(self) -> bool:
         """이메일 인증 코드 입력이 필요한지 확인"""
         page = self._page
-        # 인증 코드 입력 필드가 있는지 확인
+
+        # 1. 텍스트 기반 감지 (각각 개별 체크 - text= 셀렉터는 콤마 구분 불가)
+        for text_sel in [
+            'text="Log in verification"',
+            'text="Verification code has been sent"',
+            'text="verification code"',
+            'text="Can\'t receive the code"',
+        ]:
+            el = await page.query_selector(text_sel)
+            if el:
+                logger.info(f"인증 코드 페이지 감지 (텍스트: {text_sel})")
+                return True
+
+        # 2. 입력 필드 기반 감지 (CSS 셀렉터는 콤마 가능)
         code_input = await page.query_selector(
-            'input[type="tel"], input[aria-label*="code" i], input[placeholder*="code" i]'
+            'input[type="tel"], input[aria-label*="code" i], '
+            'input[placeholder*="code" i], input[data-index]'
         )
-        return code_input is not None
+        if code_input:
+            logger.info("인증 코드 페이지 감지 (입력 필드)")
+            return True
+
+        # 3. 6개 개별 입력 필드 패턴 감지
+        all_inputs = await page.query_selector_all(
+            'input[maxlength="1"], input[type="tel"]'
+        )
+        if len(all_inputs) >= 6:
+            logger.info(f"인증 코드 페이지 감지 (입력 필드 {len(all_inputs)}개)")
+            return True
+
+        return False
 
     async def _wait_for_verification(self, timeout: int = 300) -> bool:
         """
@@ -277,7 +454,7 @@ class TikTokShopScraper:
 
         우선순위:
         1. 환경변수 TIKTOK_VERIFICATION_CODE가 있으면 자동 입력
-        2. Gmail API로 인증 코드 이메일 자동 읽기 (Service Account 설정 시)
+        2. Gmail IMAP으로 인증 코드 이메일 자동 읽기 (App Password 설정 시)
         3. 수동 입력 대기 (headless=False 전용)
         """
         page = self._page
@@ -291,11 +468,11 @@ class TikTokShopScraper:
             await page.wait_for_timeout(5000)
             return await self._is_logged_in()
 
-        # 2. Gmail API로 인증 코드 자동 읽기
-        if self.gmail_service_account_file and self.gmail_delegated_user:
+        # 2. Gmail IMAP으로 인증 코드 자동 읽기
+        if self.gmail_imap_email and self.gmail_imap_app_password:
             code = await self._get_code_from_gmail()
             if code:
-                logger.info(f"Gmail API에서 인증 코드 획득: {code}")
+                logger.info(f"Gmail IMAP에서 인증 코드 획득: {code}")
                 await self._input_verification_code(code)
                 await page.wait_for_timeout(5000)
                 if await self._is_logged_in():
@@ -323,51 +500,96 @@ class TikTokShopScraper:
         return False
 
     async def _get_code_from_gmail(self) -> Optional[str]:
-        """Gmail API를 사용하여 TikTok 인증 코드를 읽어옵니다."""
+        """Gmail IMAP을 사용하여 TikTok 인증 코드를 읽어옵니다."""
         try:
             from utils.gmail_code_reader import GmailVerificationCodeReader
 
             reader = GmailVerificationCodeReader(
-                service_account_file=self.gmail_service_account_file,
-                delegated_user_email=self.gmail_delegated_user,
+                imap_email=self.gmail_imap_email,
+                imap_app_password=self.gmail_imap_app_password,
             )
 
-            logger.info("Gmail API로 인증 코드 이메일 폴링 시작...")
-            code = reader.wait_for_verification_code(timeout=120, poll_interval=5)
+            logger.info("Gmail IMAP으로 인증 코드 이메일 폴링 시작...")
+            code = await reader.async_wait_for_verification_code(timeout=120, poll_interval=5)
             return code
 
-        except ImportError:
-            logger.warning(
-                "google-api-python-client가 설치되지 않았습니다. "
-                "pip install google-api-python-client 실행 필요"
-            )
-            return None
         except Exception as e:
-            logger.error(f"Gmail API 인증 코드 읽기 실패: {e}")
+            logger.error(f"Gmail IMAP 인증 코드 읽기 실패: {e}")
             return None
 
     async def _input_verification_code(self, code: str):
-        """6자리 인증 코드를 개별 필드에 입력"""
+        """6자리 인증 코드를 입력"""
         page = self._page
+        logger.info(f"인증 코드 입력 시도: {code}")
 
-        # 인증 코드 입력 필드들 찾기
-        code_inputs = await page.query_selector_all(
-            'input[type="tel"], input[data-index]'
-        )
+        # 디버깅: 페이지 내 모든 input 요소 파악
+        input_info = await page.evaluate("""
+            () => {
+                const inputs = document.querySelectorAll('input');
+                return Array.from(inputs).map(el => ({
+                    type: el.type,
+                    name: el.name,
+                    id: el.id,
+                    maxlength: el.maxLength,
+                    cls: (el.className || '').substring(0, 100),
+                    placeholder: el.placeholder,
+                    visible: el.offsetParent !== null,
+                }));
+            }
+        """)
+        logger.info(f"페이지 내 input 요소: {input_info}")
 
-        if len(code_inputs) >= 6:
-            # 개별 필드에 한 글자씩 입력
-            for i, char in enumerate(code[:6]):
-                await code_inputs[i].fill(char)
-                await page.wait_for_timeout(100)
+        # 방법 1: 모든 visible input 중 코드 입력용 필드 찾기
+        # (maxlength=1인 개별 필드 또는 maxlength=6인 단일 필드)
+        code_inputs = await page.evaluate("""
+            () => {
+                const inputs = Array.from(document.querySelectorAll('input'));
+                const visible = inputs.filter(el => el.offsetParent !== null);
+                // maxlength=1 패턴 (6개 개별 필드)
+                const singleChar = visible.filter(el => el.maxLength === 1);
+                if (singleChar.length >= 6) return { type: 'individual', count: singleChar.length };
+                // type=tel 패턴
+                const telInputs = visible.filter(el => el.type === 'tel');
+                if (telInputs.length >= 6) return { type: 'tel', count: telInputs.length };
+                // 그 외 코드 입력 가능한 필드
+                const codeInput = visible.find(el =>
+                    el.maxLength === 6 || el.type === 'tel' || el.type === 'number'
+                );
+                if (codeInput) return { type: 'single', index: visible.indexOf(codeInput) };
+                return { type: 'unknown', count: visible.length };
+            }
+        """)
+        logger.info(f"코드 입력 필드 분석: {code_inputs}")
+
+        # 방법 2: 가장 확실한 접근 - 첫 번째 보이는 input 클릭 후 키보드 입력
+        # OTP 컴포넌트는 첫 필드에 포커스 후 숫자 입력 시 자동 이동
+        first_input = await page.evaluate("""
+            () => {
+                const inputs = Array.from(document.querySelectorAll('input'));
+                const visible = inputs.filter(el => el.offsetParent !== null);
+                // 이메일/비밀번호 제외
+                const codeInputs = visible.filter(el =>
+                    el.type !== 'email' && el.type !== 'password' &&
+                    !el.name.includes('email') && !el.name.includes('password')
+                );
+                if (codeInputs.length > 0) {
+                    codeInputs[0].focus();
+                    codeInputs[0].click();
+                    return true;
+                }
+                return false;
+            }
+        """)
+
+        if first_input:
+            await page.wait_for_timeout(300)
+            # 한 글자씩 키보드로 입력 (OTP 자동 이동 트리거)
+            for char in code:
+                await page.keyboard.press(char)
+                await page.wait_for_timeout(150)
+            logger.info("인증 코드 키보드 입력 완료")
         else:
-            # 단일 필드일 경우 키보드로 입력
-            first_input = await page.query_selector(
-                'input[type="tel"], input[aria-label*="code" i]'
-            )
-            if first_input:
-                await first_input.click()
-                await page.keyboard.type(code, delay=100)
+            logger.error("인증 코드 입력 필드를 찾을 수 없음")
 
     # =========================================================================
     # Review Scraping
@@ -399,10 +621,19 @@ class TikTokShopScraper:
         all_reviews = []
         error_count = 0
 
-        # Rating 페이지로 이동
+        # Rating 페이지로 이동 (이미 해당 페이지에 있으면 건너뜀 - 이중 네비게이션 방지)
         logger.info(f"리뷰 수집 시작: {start_date} ~ {end_date}")
-        await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
+        if "/product/rating" not in page.url:
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+        else:
+            logger.info("이미 Rating 페이지에 있음 - 네비게이션 건너뜀")
+
+        # 공지사항/알림 팝업 닫기
+        await self._dismiss_popups()
+
+        # Rating 페이지에서도 캡차가 나올 수 있음
+        await self._handle_captcha()
 
         # 로그인 상태 재확인
         if not await self._is_logged_in():

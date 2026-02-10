@@ -17,8 +17,8 @@ from config.settings import (
     TIKTOK_SPREADSHEET_ID,
     TIKTOK_SHEET_NAME,
     TIKTOK_DATA_DIR,
-    TIKTOK_GMAIL_SERVICE_ACCOUNT,
-    TIKTOK_GMAIL_DELEGATED_USER,
+    TIKTOK_GMAIL_IMAP_EMAIL,
+    TIKTOK_GMAIL_IMAP_APP_PASSWORD,
     get_tiktok_collection_date_range,
 )
 
@@ -58,15 +58,12 @@ async def scrape_tiktok_reviews() -> dict:
         password=TIKTOK_PASSWORD,
         data_dir=TIKTOK_DATA_DIR,
         headless=headless,
-        gmail_service_account_file=TIKTOK_GMAIL_SERVICE_ACCOUNT,
-        gmail_delegated_user=TIKTOK_GMAIL_DELEGATED_USER,
+        gmail_imap_email=TIKTOK_GMAIL_IMAP_EMAIL,
+        gmail_imap_app_password=TIKTOK_GMAIL_IMAP_APP_PASSWORD,
     )
 
     try:
-        result = scraper.scrape(start_date, end_date)
-        # scrape()는 코루틴이므로 await
-        if asyncio.iscoroutine(result):
-            result = await result
+        result = await scraper.scrape(start_date, end_date)
         logger.info(f"수집 완료: {result.get('total_reviews', 0)}개 리뷰")
         return result
     except Exception as e:

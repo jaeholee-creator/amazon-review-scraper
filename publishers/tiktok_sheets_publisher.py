@@ -59,14 +59,29 @@ class TikTokGoogleSheetsPublisher:
             raise
 
     def _get_or_create_sheet(self) -> gspread.Worksheet:
-        """시트 가져오기 또는 생성"""
+        """시트 가져오기 또는 생성 (gspread 캐시 문제 회피)"""
+        # 방법 1: worksheets() 목록에서 직접 검색 (캐시 불일치 방지)
         try:
-            return self.spreadsheet.worksheet(self.sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            logger.info(f"시트 '{self.sheet_name}'를 찾을 수 없어 새로 생성합니다.")
+            all_sheets = self.spreadsheet.worksheets()
+            for sheet in all_sheets:
+                if sheet.title == self.sheet_name:
+                    return sheet
+        except Exception as e:
+            logger.warning(f"워크시트 목록 조회 실패: {e}")
+
+        # 방법 2: 새로 생성 시도
+        try:
+            logger.info(f"시트 '{self.sheet_name}'를 새로 생성합니다.")
             return self.spreadsheet.add_worksheet(
                 title=self.sheet_name, rows=1000, cols=20
             )
+        except gspread.exceptions.APIError as e:
+            if "already exists" in str(e):
+                # 생성 충돌: 메타데이터 리프레시 후 재조회
+                logger.warning(f"시트 이미 존재 - 메타데이터 리프레시 후 재조회")
+                self.spreadsheet.fetch_sheet_metadata()
+                return self.spreadsheet.worksheet(self.sheet_name)
+            raise
 
     def _read_existing_review_ids(self) -> set[str]:
         """기존 review_id 집합 읽기"""

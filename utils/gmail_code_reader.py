@@ -1,69 +1,63 @@
 """
-Gmail API를 사용하여 TikTok 인증 코드를 자동으로 읽는 유틸리티.
+Gmail IMAP을 사용하여 TikTok 인증 코드를 자동으로 읽는 유틸리티.
 
-Service Account + Domain-Wide Delegation 방식으로 Gmail에 접근하여
+IMAP + App Password 방식으로 Gmail에 접근하여
 TikTok에서 발송한 인증 코드 이메일을 검색하고 6자리 코드를 추출합니다.
+
+Google Cloud Console 권한 불필요 - Python 표준 라이브러리만 사용.
 """
-import base64
+import email
+import imaplib
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
-# Gmail API 스코프
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-# TikTok 인증 이메일 발신자 패턴
-TIKTOK_SENDER_QUERY = "(from:verify@tiktok.com OR from:noreply@tiktok.com)"
+# TikTok 인증 이메일 발신자
+TIKTOK_SENDERS = [
+    "register@account.tiktok.com",
+    "verify@tiktok.com",
+    "noreply@tiktok.com",
+]
 
 # 6자리 인증 코드 정규식
 VERIFICATION_CODE_PATTERN = re.compile(r"\b(\d{6})\b")
 
 
 class GmailVerificationCodeReader:
-    """Gmail API를 사용하여 TikTok 인증 코드를 자동으로 읽는 유틸리티"""
+    """Gmail IMAP을 사용하여 TikTok 인증 코드를 자동으로 읽는 유틸리티"""
 
-    def __init__(
-        self,
-        service_account_file: str,
-        delegated_user_email: str,
-    ):
+    IMAP_SERVER = "imap.gmail.com"
+    IMAP_PORT = 993
+
+    def __init__(self, imap_email: str, imap_app_password: str):
         """
         Args:
-            service_account_file: Service Account JSON 키 파일 경로
-            delegated_user_email: Domain-Wide Delegation 대상 사용자 이메일
+            imap_email: Gmail 이메일 주소
+            imap_app_password: Google App Password (2FA 활성화 후 생성)
         """
-        self.service_account_file = service_account_file
-        self.delegated_user_email = delegated_user_email
-        self._service = None
+        self.imap_email = imap_email
+        self.imap_app_password = imap_app_password
 
-    def _get_gmail_service(self):
-        """Gmail API 서비스 객체 생성 (lazy initialization)"""
-        if self._service is not None:
-            return self._service
-
-        credentials = service_account.Credentials.from_service_account_file(
-            self.service_account_file,
-            scopes=GMAIL_SCOPES,
-        )
-        delegated_credentials = credentials.with_subject(self.delegated_user_email)
-        self._service = build("gmail", "v1", credentials=delegated_credentials)
-        return self._service
+    def _connect(self) -> imaplib.IMAP4_SSL:
+        """IMAP SSL 연결 및 로그인"""
+        mail = imaplib.IMAP4_SSL(self.IMAP_SERVER, self.IMAP_PORT)
+        mail.login(self.imap_email, self.imap_app_password)
+        return mail
 
     def test_connection(self) -> bool:
-        """Gmail API 연결 테스트"""
+        """IMAP 연결 테스트"""
         try:
-            service = self._get_gmail_service()
-            profile = service.users().getProfile(userId="me").execute()
-            logger.info(f"Gmail API 연결 성공: {profile.get('emailAddress')}")
+            mail = self._connect()
+            mail.select("INBOX", readonly=True)
+            logger.info(f"Gmail IMAP 연결 성공: {self.imap_email}")
+            mail.logout()
             return True
         except Exception as e:
-            logger.error(f"Gmail API 연결 실패: {e}")
+            logger.error(f"Gmail IMAP 연결 실패: {e}")
             return False
 
     def wait_for_verification_code(
@@ -71,19 +65,9 @@ class GmailVerificationCodeReader:
         timeout: int = 120,
         poll_interval: int = 5,
     ) -> Optional[str]:
-        """
-        TikTok 인증 코드 이메일이 도착할 때까지 폴링하여 코드를 추출합니다.
-
-        Args:
-            timeout: 최대 대기 시간 (초)
-            poll_interval: 폴링 간격 (초)
-
-        Returns:
-            6자리 인증 코드 문자열 또는 None (타임아웃)
-        """
+        """동기 버전 (폴백용)"""
         start_time = time.time()
-        # 검색 시작 시점의 epoch (초 단위) - 약간의 여유를 두고 10초 전부터 검색
-        search_after_epoch = int(start_time) - 10
+        search_after = datetime.now(timezone.utc) - timedelta(seconds=30)
 
         logger.info(
             f"TikTok 인증 코드 이메일 대기 시작 "
@@ -91,7 +75,7 @@ class GmailVerificationCodeReader:
         )
 
         while time.time() - start_time < timeout:
-            code = self._search_verification_code(search_after_epoch)
+            code = self._search_verification_code(search_after)
             if code:
                 logger.info(f"인증 코드 발견: {code}")
                 return code
@@ -103,101 +87,135 @@ class GmailVerificationCodeReader:
         logger.error(f"인증 코드 이메일 대기 타임아웃 ({timeout}초)")
         return None
 
-    def _search_verification_code(self, after_epoch: int) -> Optional[str]:
+    async def async_wait_for_verification_code(
+        self,
+        timeout: int = 120,
+        poll_interval: int = 5,
+    ) -> Optional[str]:
+        """비동기 버전: Playwright event loop를 블로킹하지 않음"""
+        import asyncio
+
+        start_time = time.time()
+        search_after = datetime.now(timezone.utc) - timedelta(seconds=30)
+
+        logger.info(
+            f"TikTok 인증 코드 이메일 대기 시작 "
+            f"(최대 {timeout}초, {poll_interval}초 간격)"
+        )
+
+        loop = asyncio.get_event_loop()
+        while time.time() - start_time < timeout:
+            code = await loop.run_in_executor(
+                None, self._search_verification_code, search_after
+            )
+            if code:
+                logger.info(f"인증 코드 발견: {code}")
+                return code
+
+            elapsed = int(time.time() - start_time)
+            logger.info(f"  인증 코드 대기 중... ({elapsed}초 경과)")
+            await asyncio.sleep(poll_interval)
+
+        logger.error(f"인증 코드 이메일 대기 타임아웃 ({timeout}초)")
+        return None
+
+    def _search_verification_code(self, after: datetime) -> Optional[str]:
         """
-        Gmail에서 TikTok 인증 코드 이메일을 검색하고 코드를 추출합니다.
+        Gmail IMAP에서 TikTok 인증 코드 이메일을 검색하고 코드를 추출합니다.
 
         Args:
-            after_epoch: 이 시점 이후의 이메일만 검색 (Unix epoch 초)
+            after: 이 시점 이후의 이메일만 검색
 
         Returns:
             6자리 인증 코드 또는 None
         """
+        mail = None
         try:
-            service = self._get_gmail_service()
+            mail = self._connect()
+            mail.select("INBOX", readonly=True)
 
-            # Gmail 검색 쿼리: TikTok 발신 + 최근 2분 이내
-            query = f"{TIKTOK_SENDER_QUERY} newer_than:2m"
+            # IMAP 검색: 오늘 날짜 이후 + TikTok 발신자
+            # IMAP SINCE는 날짜 단위 (시간 불가)이므로 오늘 날짜로 검색
+            date_str = after.strftime("%d-%b-%Y")
 
-            results = (
-                service.users()
-                .messages()
-                .list(userId="me", q=query, maxResults=5)
-                .execute()
-            )
+            for sender in TIKTOK_SENDERS:
+                search_criteria = f'(FROM "{sender}" SINCE {date_str})'
+                status, msg_ids = mail.search(None, search_criteria)
 
-            messages = results.get("messages", [])
-            if not messages:
-                return None
-
-            # 가장 최신 메시지부터 확인
-            for msg_ref in messages:
-                msg = (
-                    service.users()
-                    .messages()
-                    .get(userId="me", id=msg_ref["id"], format="full")
-                    .execute()
-                )
-
-                # 메시지 수신 시간 확인 (after_epoch 이후만)
-                internal_date = int(msg.get("internalDate", "0")) // 1000
-                if internal_date < after_epoch:
+                if status != "OK" or not msg_ids[0]:
                     continue
 
-                # 이메일 본문에서 코드 추출
-                code = self._extract_code_from_message(msg)
-                if code:
-                    return code
+                # 가장 최신 메시지부터 확인 (역순)
+                id_list = msg_ids[0].split()
+                for msg_id in reversed(id_list):
+                    status, msg_data = mail.fetch(msg_id, "(RFC822)")
+                    if status != "OK":
+                        continue
 
+                    raw_email = msg_data[0][1]
+                    msg = email.message_from_bytes(raw_email)
+
+                    # 수신 시간 확인 (after 이후만)
+                    msg_date = email.utils.parsedate_to_datetime(msg["Date"])
+                    if msg_date.tzinfo is None:
+                        msg_date = msg_date.replace(tzinfo=timezone.utc)
+                    if msg_date < after:
+                        continue
+
+                    # 본문에서 코드 추출
+                    body = self._get_message_body(msg)
+                    code = self._extract_code(body)
+                    if code:
+                        mail.logout()
+                        return code
+
+            mail.logout()
             return None
 
         except Exception as e:
-            logger.warning(f"Gmail 검색 오류: {e}")
+            logger.warning(f"Gmail IMAP 검색 오류: {e}")
+            if mail:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
             return None
 
-    def _extract_code_from_message(self, message: dict) -> Optional[str]:
-        """
-        Gmail 메시지 본문에서 6자리 인증 코드를 추출합니다.
+    @staticmethod
+    def _get_message_body(msg: email.message.Message) -> str:
+        """이메일 메시지에서 본문 텍스트를 추출합니다."""
+        parts = []
 
-        Args:
-            message: Gmail API 메시지 객체
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                if content_type in ("text/plain", "text/html"):
+                    try:
+                        charset = part.get_content_charset() or "utf-8"
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            parts.append(payload.decode(charset, errors="replace"))
+                    except Exception:
+                        pass
+        else:
+            try:
+                charset = msg.get_content_charset() or "utf-8"
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    parts.append(payload.decode(charset, errors="replace"))
+            except Exception:
+                pass
 
-        Returns:
-            6자리 코드 문자열 또는 None
-        """
-        body_text = self._get_message_body(message)
-        if not body_text:
+        return "\n".join(parts)
+
+    @staticmethod
+    def _extract_code(body: str) -> Optional[str]:
+        """본문 텍스트에서 6자리 인증 코드를 추출합니다."""
+        if not body:
             return None
 
-        # 6자리 숫자 패턴 검색
-        matches = VERIFICATION_CODE_PATTERN.findall(body_text)
+        matches = VERIFICATION_CODE_PATTERN.findall(body)
         if matches:
-            # 첫 번째 매치 반환 (보통 인증 코드가 가장 먼저 나옴)
             return matches[0]
 
         return None
-
-    @staticmethod
-    def _get_message_body(message: dict) -> str:
-        """Gmail 메시지에서 본문 텍스트를 추출합니다."""
-        payload = message.get("payload", {})
-        parts = []
-
-        def _extract_parts(payload_part: dict):
-            mime_type = payload_part.get("mimeType", "")
-            body = payload_part.get("body", {})
-            data = body.get("data", "")
-
-            if data and mime_type in ("text/plain", "text/html"):
-                try:
-                    decoded = base64.urlsafe_b64decode(data).decode("utf-8")
-                    parts.append(decoded)
-                except Exception:
-                    pass
-
-            # 멀티파트 메시지 처리
-            for sub_part in payload_part.get("parts", []):
-                _extract_parts(sub_part)
-
-        _extract_parts(payload)
-        return "\n".join(parts)

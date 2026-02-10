@@ -33,16 +33,6 @@ jobs:
         run: |
           echo '${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}' > credentials.json
 
-      # Gmail API Service Account 설정 (TikTok 인증 코드 자동 읽기용)
-      - name: Create Gmail Service Account credentials
-        run: |
-          if [ -n "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" ]; then
-            echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > gmail_service_account.json
-            echo "Gmail Service Account 설정 완료"
-          else
-            echo "Gmail Service Account 미설정 - 쿠키 기반 인증만 사용"
-          fi
-
       # TikTok 쿠키 복원 (사전에 저장된 쿠키)
       - name: Restore TikTok cookies
         run: |
@@ -62,20 +52,22 @@ jobs:
           echo "TIKTOK_HEADLESS=true" >> $GITHUB_ENV
           echo "AMAZON_EMAIL=${{ secrets.AMAZON_EMAIL }}" >> $GITHUB_ENV
           echo "AMAZON_PASSWORD=${{ secrets.AMAZON_PASSWORD }}" >> $GITHUB_ENV
-          echo "TIKTOK_GMAIL_SERVICE_ACCOUNT=gmail_service_account.json" >> $GITHUB_ENV
-          echo "TIKTOK_GMAIL_DELEGATED_USER=${{ secrets.TIKTOK_GMAIL_DELEGATED_USER }}" >> $GITHUB_ENV
+          echo "TIKTOK_GMAIL_IMAP_EMAIL=${{ secrets.TIKTOK_GMAIL_IMAP_EMAIL }}" >> $GITHUB_ENV
+          echo "TIKTOK_GMAIL_IMAP_APP_PASSWORD=${{ secrets.TIKTOK_GMAIL_IMAP_APP_PASSWORD }}" >> $GITHUB_ENV
 
       # TikTok 리뷰 수집 실행
       - name: Run TikTok Shop Review Scraper
         run: python tiktok_daily_scraper.py
 
-      # 로그 업로드 (실패 시)
-      - name: Upload logs on failure
+      # 로그 및 스크린샷 업로드 (실패 시)
+      - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: tiktok-scraper-logs
-          path: data/tiktok/tiktok_scraper.log
+          name: tiktok-scraper-debug
+          path: |
+            data/tiktok/tiktok_scraper.log
+            data/tiktok/*.png
           retention-days: 7
 
       # 성공 알림
