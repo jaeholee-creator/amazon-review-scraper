@@ -285,7 +285,7 @@ async def main():
 
     # Step 1: 세션 초기화 (Single Page Architecture)
     print("\n[Step 1] Session initialization...")
-    session = BrowserSession()
+    session = BrowserSession(region='us')  # US 설정 사용
     user_agent = random.choice(USER_AGENTS)
 
     try:

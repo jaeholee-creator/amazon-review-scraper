@@ -15,13 +15,6 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 from bs4 import BeautifulSoup
 
 from src.parser import ReviewParser
-from config.settings import (
-    COOKIES_FILE,
-    DATA_DIR,
-    AMAZON_BASE_URL,
-    AMAZON_EMAIL,
-    AMAZON_PASSWORD,
-)
 
 # CAPTCHA는 수동 해결 (manual_login.py)
 
@@ -29,14 +22,50 @@ from config.settings import (
 class BrowserSession:
     """단일 Page 기반 Amazon 브라우저 세션."""
 
-    def __init__(self):
+    def __init__(self, region: str = 'us'):
+        """
+        Args:
+            region: 'us' 또는 'uk'
+        """
+        self._region = region.lower()
+
+        # Region에 따라 동적으로 설정 로드
+        if self._region == 'uk':
+            from config.settings_uk import (
+                DATA_DIR,
+                AMAZON_BASE_URL,
+                AMAZON_EMAIL_UK,
+                AMAZON_PASSWORD_UK,
+            )
+            self._data_dir = DATA_DIR
+            self._base_url = AMAZON_BASE_URL
+            self._email = AMAZON_EMAIL_UK
+            self._password = AMAZON_PASSWORD_UK
+            self._locale = 'en-GB'
+            self._timezone = 'Europe/London'
+        else:  # us (default)
+            from config.settings import (
+                DATA_DIR,
+                AMAZON_BASE_URL,
+                AMAZON_EMAIL,
+                AMAZON_PASSWORD,
+            )
+            self._data_dir = DATA_DIR
+            self._base_url = AMAZON_BASE_URL
+            self._email = AMAZON_EMAIL
+            self._password = AMAZON_PASSWORD
+            self._locale = 'en-US'
+            self._timezone = 'America/New_York'
+
+        self._cookies_file = f'{self._data_dir}/cookies_{self._region}.json'
+
         self._playwright = None
         self._browser = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._last_csrf: str = ''
         self._parser = ReviewParser()
-        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(self._data_dir, exist_ok=True)
 
     # =========================================================================
     # Lifecycle
@@ -48,12 +77,12 @@ class BrowserSession:
         self._browser = await self._playwright.firefox.launch(headless=True)
         self._context = await self._browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            locale='en-US',
-            timezone_id='America/New_York',
+            locale=self._locale,
+            timezone_id=self._timezone,
         )
         self._page = await self._context.new_page()  # 유일한 new_page()
         self._page.on('request', self._on_request)   # 1회만 등록
-        print("   Browser started (Firefox, single page)")
+        print(f"   Browser started (Firefox, {self._region.upper()}, single page)")
 
     async def close(self):
         """브라우저 리소스 정리."""
@@ -85,20 +114,20 @@ class BrowserSession:
         page = self._page
 
         # 1) 저장된 쿠키 로드 시도
-        if os.path.exists(COOKIES_FILE):
+        if os.path.exists(self._cookies_file):
             try:
-                with open(COOKIES_FILE, 'r') as f:
+                with open(self._cookies_file, 'r') as f:
                     cookies = json.load(f)
                 await self._context.add_cookies(cookies)
                 print(f"   Loaded saved cookies ({len(cookies)} entries)")
 
                 # 같은 페이지에서 홈페이지 방문 → 로그인 확인
-                await page.goto(AMAZON_BASE_URL, wait_until='domcontentloaded')
+                await page.goto(self._base_url, wait_until='domcontentloaded')
                 await page.wait_for_timeout(3000)
 
                 if await self._is_logged_in(page):
                     # 같은 페이지에서 리뷰 페이지 검증
-                    review_url = f'{AMAZON_BASE_URL}/product-reviews/B0B2RM68G2?pageNumber=1&sortBy=recent'
+                    review_url = f'{self._base_url}/product-reviews/B0B2RM68G2?pageNumber=1&sortBy=recent'
                     await page.goto(review_url, wait_until='networkidle', timeout=30000)
                     await page.wait_for_timeout(3000)
 
@@ -124,7 +153,7 @@ class BrowserSession:
             raise Exception("Auto-login failed - check credentials or CAPTCHA")
 
         # 3) 로그인 후 리뷰 페이지 검증 (같은 페이지에서)
-        review_url = f'{AMAZON_BASE_URL}/product-reviews/B0B2RM68G2?pageNumber=1&sortBy=recent'
+        review_url = f'{self._base_url}/product-reviews/B0B2RM68G2?pageNumber=1&sortBy=recent'
         print("   Verifying review page access...")
         await page.goto(review_url, wait_until='networkidle', timeout=30000)
         await page.wait_for_timeout(3000)
@@ -155,7 +184,7 @@ class BrowserSession:
             print("   Attempting automatic login...")
 
             # Step 1: 홈페이지
-            await page.goto(AMAZON_BASE_URL, wait_until='domcontentloaded')
+            await page.goto(self._base_url, wait_until='domcontentloaded')
             await page.wait_for_timeout(3000)
 
             # Step 2: Sign In 클릭
@@ -165,7 +194,7 @@ class BrowserSession:
                 await page.wait_for_timeout(3000)
             else:
                 await page.goto(
-                    f'{AMAZON_BASE_URL}/gp/sign-in.html',
+                    f'{self._base_url}/gp/sign-in.html',
                     wait_until='domcontentloaded',
                 )
                 await page.wait_for_timeout(3000)
@@ -184,7 +213,7 @@ class BrowserSession:
 
             if email_field:
                 print("   Email field found -> full login flow")
-                await email_field.fill(AMAZON_EMAIL)
+                await email_field.fill(self._email)
                 try:
                     await page.click('#continue', timeout=5000)
                 except Exception:
@@ -210,7 +239,7 @@ class BrowserSession:
                 return False
 
             # Step 4: 비밀번호 입력 + Sign In
-            await pw_field.fill(AMAZON_PASSWORD)
+            await pw_field.fill(self._password)
             try:
                 await page.click('#signInSubmit', timeout=5000)
             except Exception:
@@ -223,7 +252,7 @@ class BrowserSession:
             otp_field = await page.query_selector('#auth-mfa-otpcode, #ap_dcq_hint, input[name="otpCode"]')
             if otp_field:
                 print("   2FA/OTP required - saving screenshot")
-                await page.screenshot(path=f'{DATA_DIR}/debug_2fa.png')
+                await page.screenshot(path=f'{self._data_dir}/debug_2fa.png')
 
             # "approve notification" 처리 (앱 승인 요청)
             approve_text = await page.query_selector('text="Approve the notification"')
@@ -244,7 +273,7 @@ class BrowserSession:
             if captcha or funcaptcha:
                 captcha_type = "FunCaptcha" if funcaptcha else "Image CAPTCHA"
                 print(f"   {captcha_type} detected after password submission")
-                await page.screenshot(path=f'{DATA_DIR}/debug_captcha.png')
+                await page.screenshot(path=f'{self._data_dir}/debug_captcha.png')
                 print("   Manual solving required: python3 manual_login.py")
                 return False
 
@@ -263,7 +292,7 @@ class BrowserSession:
                 return True
 
             # 디버그: 실패 시 스크린샷 저장
-            await page.screenshot(path=f'{DATA_DIR}/debug_login_fail.png')
+            await page.screenshot(path=f'{self._data_dir}/debug_login_fail.png')
             print(f"   Login verification failed (screenshot saved)")
             return False
 
@@ -283,7 +312,7 @@ class BrowserSession:
     async def _save_cookies(self):
         """현재 컨텍스트 쿠키를 파일에 저장."""
         cookies = await self._context.cookies()
-        with open(COOKIES_FILE, 'w') as f:
+        with open(self._cookies_file, 'w') as f:
             json.dump(cookies, f)
         print(f"   Session saved ({len(cookies)} cookies)")
 
@@ -311,7 +340,7 @@ class BrowserSession:
 
             # 같은 페이지에서 리뷰 페이지로 이동
             review_url = (
-                f'{AMAZON_BASE_URL}/product-reviews/{asin}'
+                f'{self._base_url}/product-reviews/{asin}'
                 f'?pageNumber=1&sortBy=recent'
                 f'&reviewerType=all_reviews&filterByStar=all_stars'
             )
