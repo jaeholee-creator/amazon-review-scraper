@@ -45,7 +45,7 @@ CUTOFF_DATE = datetime.now() - timedelta(days=DAYS_TO_SCRAPE)
 # =============================================================================
 # DYNAMIC DATE FUNCTIONS (for daily batch mode)
 # =============================================================================
-COLLECTION_WINDOW_DAYS = 2
+COLLECTION_WINDOW_DAYS = 7  # 최근 7일간 리뷰 수집
 
 def get_yesterday_kst():
     now_kst = datetime.now(KST)

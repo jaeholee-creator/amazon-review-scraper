@@ -32,7 +32,7 @@ if not AMAZON_EMAIL_UK or not AMAZON_PASSWORD_UK:
 # =============================================================================
 # DATE FILTER
 # =============================================================================
-COLLECTION_WINDOW_DAYS = 2
+COLLECTION_WINDOW_DAYS = 7  # 최근 7일간 리뷰 수집
 
 def get_collection_date_range():
     """

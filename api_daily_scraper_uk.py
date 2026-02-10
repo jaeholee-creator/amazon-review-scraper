@@ -172,15 +172,25 @@ def collect_via_api(
             reviews = api_fetch_page(headers, asin, page_num)
 
             if not reviews:
+                print(f"   [Page {page_num}] No reviews returned from API")
                 break
+
+            # 디버그: 날짜 필터링 전 리뷰 확인
+            print(f"   [Page {page_num}] API returned {len(reviews)} reviews")
+            if reviews and len(reviews) > 0:
+                first_review = reviews[0]
+                print(f"   [DEBUG] First review date: {first_review.get('date')} → parsed: {first_review.get('date_parsed')}")
 
             filtered, cutoff = filter_reviews(reviews, start_date, end_date, collected_ids)
             all_reviews.extend(filtered)
 
             if filtered:
-                print(f"   [Page {page_num}] +{len(filtered)} reviews")
+                print(f"   [Page {page_num}] +{len(filtered)} reviews (after date filter)")
+            else:
+                print(f"   [Page {page_num}] 0 reviews (all filtered out)")
+
             if cutoff:
-                print(f"   Date cutoff reached at page {page_num}")
+                print(f"   Date cutoff reached at page {page_num} (reviews too old)")
                 break
 
             error_count = 0
