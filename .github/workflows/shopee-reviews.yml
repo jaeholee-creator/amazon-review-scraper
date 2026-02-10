@@ -1,0 +1,61 @@
+name: Shopee Reviews Collection
+
+on:
+  schedule:
+    # 매일 KST 오전 10시 (UTC 1시)
+    - cron: '0 1 * * *'
+  workflow_dispatch:  # 수동 실행 허용
+
+jobs:
+  collect-shopee-reviews:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Google Sheets 인증 설정
+      - name: Create credentials
+        run: |
+          echo '${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}' > credentials.json
+
+      # 환경변수 설정
+      - name: Set environment variables
+        run: |
+          echo "GOOGLE_SHEETS_SPREADSHEET_ID=${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}" >> $GITHUB_ENV
+
+      # 데이터 디렉토리 생성
+      - name: Create data directory
+        run: mkdir -p data
+
+      # Shopee 리뷰 수집 실행
+      - name: Run Shopee Review Scraper
+        run: python shopee_daily_scraper.py
+
+      # 로그 업로드 (실패 시)
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopee-scraper-logs
+          path: data/shopee_scraper.log
+          retention-days: 7
+
+      # 성공 알림 (선택사항)
+      - name: Success notification
+        if: success()
+        run: |
+          echo "✅ Shopee 리뷰 수집 완료"
+          echo "📊 Singapore & Philippines 리뷰가 Google Sheets에 업데이트되었습니다"

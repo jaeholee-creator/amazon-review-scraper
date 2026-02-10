@@ -174,3 +174,38 @@ PRODUCT_NAMES = {
     'B0CWGSP1WY': 'Hydro Cera-nol Real Deep Mask (4ea)',
     'B0DDXV5KV4': 'Collagen Gel Toner Pads (60 Pads)',
 }
+
+# =============================================================================
+# SHOPEE CONFIGURATION
+# =============================================================================
+SHOPEE_SHOPS = {
+    'sg': {
+        'userid': '951704668',
+        'shopid': '951591050',
+        'country': 'sg',
+        'sheet_name': 'SG_shopee',
+        'timezone': pytz.timezone('Asia/Singapore')
+    },
+    'ph': {
+        'userid': '952208252',
+        'shopid': '952094055',
+        'country': 'ph',
+        'sheet_name': 'PH_shopee',
+        'timezone': pytz.timezone('Asia/Manila')
+    }
+}
+
+# Shopee 스프레드시트 ID (기존과 동일)
+SHOPEE_SPREADSHEET_ID = '1NVUVShv5tAveINA9DdB2D21z71L3tF0In5JVK6LYX9s'
+
+def get_shopee_collection_date_range():
+    """
+    Shopee 리뷰 수집 날짜 범위: today() ~ today()-3
+
+    Returns: (start_date, end_date) as datetime objects
+    """
+    from datetime import date
+    now = datetime.now()
+    end_date = now
+    start_date = now - timedelta(days=COLLECTION_WINDOW_DAYS)
+    return start_date, end_date
