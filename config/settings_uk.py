@@ -32,7 +32,7 @@ if not AMAZON_EMAIL_UK or not AMAZON_PASSWORD_UK:
 # =============================================================================
 # DATE FILTER
 # =============================================================================
-COLLECTION_WINDOW_DAYS = 7  # 최근 7일간 리뷰 수집
+COLLECTION_WINDOW_DAYS = 3  # 최근 3일간 리뷰 수집
 
 def get_collection_date_range():
     """
@@ -95,7 +95,7 @@ SCRAPER_STATE_FILE = f'{DATA_DIR}/scraper_state_uk.json'
 # =============================================================================
 AMAZON_BASE_URL = 'https://www.amazon.co.uk'
 LOGIN_URL = f'{AMAZON_BASE_URL}/ap/signin'
-API_URL = 'https://www.amazon.co.uk/portal/customer-reviews/ajax/reviews/get/ref=cm_cr_arp_d_paging_btm_next_1'
+PRODUCTS_CSV = 'config/products_uk.csv'
 
 # =============================================================================
 # GOOGLE SHEETS

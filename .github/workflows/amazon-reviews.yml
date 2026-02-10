@@ -48,7 +48,7 @@ jobs:
           echo "GOOGLE_SHEETS_SPREADSHEET_ID=${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}" >> $GITHUB_ENV
 
       - name: Run Amazon Review Scraper
-        run: python api_daily_scraper.py
+        run: python daily_scraper.py --region us
         env:
           HEADLESS: true
 

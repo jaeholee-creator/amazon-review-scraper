@@ -8,8 +8,11 @@ debug_firefox.py의 성공 패턴을 정확히 복제:
 - 네트워크 인터셉터로 CSRF 자동 캡처
 """
 
+import asyncio
 import json
 import os
+import random
+from datetime import date
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 from bs4 import BeautifulSoup
@@ -412,3 +415,142 @@ class BrowserSession:
         return self._cookie_str_cache
 
     _cookie_str_cache: str = ''
+
+    # =========================================================================
+    # HTML Scraping (Full page crawling - no API)
+    # =========================================================================
+
+    async def scrape_reviews_html(
+        self,
+        asin: str,
+        start_date: date,
+        end_date: date,
+        existing_ids: set,
+        max_pages: int = 100,
+    ) -> tuple[list, str, str | None]:
+        """
+        Playwright HTML 크롤링으로 리뷰 수집.
+        API 사용 없이 같은 페이지에서 goto()로 리뷰 페이지를 순회.
+
+        Args:
+            asin: 제품 ASIN
+            start_date: 수집 시작일 (date)
+            end_date: 수집 종료일 (date)
+            existing_ids: 이미 수집된 리뷰 ID set (중복 방지)
+            max_pages: 최대 페이지 수
+
+        Returns:
+            (reviews, status, error_msg) - collect_via_api와 동일 시그니처
+        """
+        page = self._page
+        all_reviews = []
+        error_count = 0
+
+        # Region별 딜레이 설정 로드
+        if self._region == 'uk':
+            from config.settings_uk import MIN_DELAY, MAX_DELAY
+        else:
+            from config.settings import MIN_DELAY, MAX_DELAY
+
+        # 첫 페이지: URL로 이동
+        first_url = (
+            f'{self._base_url}/product-reviews/{asin}'
+            f'?pageNumber=1&sortBy=recent'
+            f'&reviewerType=all_reviews&filterByStar=all_stars'
+        )
+        await page.goto(first_url, wait_until='networkidle', timeout=30000)
+
+        # 로그인 리다이렉트 체크
+        if '/ap/' in page.url:
+            print(f"   Session expired. Re-login...")
+            if not await self.re_login():
+                return all_reviews, 'failed', 'Session expired'
+            await page.goto(first_url, wait_until='networkidle', timeout=30000)
+            if '/ap/' in page.url:
+                return all_reviews, 'failed', 'Auth redirect after re-login'
+
+        for page_num in range(1, max_pages + 1):
+            try:
+                # 리뷰 요소 대기
+                try:
+                    await page.wait_for_selector('[data-hook="review"]', timeout=8000)
+                except Exception:
+                    print(f"   No reviews on page {page_num}. End reached.")
+                    break
+
+                html = await page.content()
+
+                # CAPTCHA 감지
+                captcha_indicators = [
+                    'Enter the characters you see below',
+                    'Type the characters',
+                    'solve this puzzle',
+                    'api.arkoselabs.com',
+                ]
+                if any(indicator in html for indicator in captcha_indicators):
+                    return all_reviews, 'partial' if all_reviews else 'failed', 'CAPTCHA detected'
+
+                # HTML 파싱
+                soup = BeautifulSoup(html, 'html.parser')
+                reviews = self._parser.parse_reviews(soup)
+
+                if not reviews:
+                    break
+
+                # 날짜 필터링 + 중복 제거
+                new_reviews = []
+                reached_cutoff = False
+
+                for review in reviews:
+                    review_date = review.get('date_parsed')
+                    if not review_date:
+                        continue
+
+                    review_date_only = review_date.date() if hasattr(review_date, 'date') else review_date
+                    review_id = review.get('review_id', '')
+
+                    if review_date_only < start_date:
+                        print(f"   Date cutoff ({review_date_only} < {start_date}). Stopping.")
+                        reached_cutoff = True
+                        break
+                    elif review_date_only > end_date:
+                        continue
+
+                    if review_id and review_id in existing_ids:
+                        continue
+
+                    review['asin'] = asin
+                    new_reviews.append(review)
+                    if review_id:
+                        existing_ids.add(review_id)
+
+                if new_reviews:
+                    all_reviews.extend(new_reviews)
+                    print(f"   [Page {page_num}] +{len(new_reviews)} reviews | Total: {len(all_reviews)}")
+                else:
+                    print(f"   [Page {page_num}] No matching reviews")
+
+                if reached_cutoff:
+                    break
+
+                error_count = 0
+
+                # "Next page" 버튼 클릭으로 다음 페이지 이동
+                next_link = await page.query_selector('li.a-last a')
+                if not next_link:
+                    print(f"   No next page button. End reached.")
+                    break
+
+                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                await next_link.click()
+                await page.wait_for_load_state('networkidle', timeout=30000)
+
+            except Exception as e:
+                error_count += 1
+                print(f"   Error on page {page_num}: {e}")
+                if error_count >= 3:
+                    return all_reviews, 'partial' if all_reviews else 'failed', str(e)
+                await asyncio.sleep(3)
+
+        status = 'success' if all_reviews or error_count == 0 else 'failed'
+        return all_reviews, status, None

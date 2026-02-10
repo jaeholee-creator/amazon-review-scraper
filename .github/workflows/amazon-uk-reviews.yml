@@ -49,7 +49,7 @@ jobs:
           echo "AMAZON_PASSWORD_UK=${{ secrets.AMAZON_PASSWORD_UK }}" >> $GITHUB_ENV
 
       - name: Run Amazon UK Review Scraper
-        run: python api_daily_scraper_uk.py
+        run: python daily_scraper.py --region uk
         env:
           HEADLESS: true
 

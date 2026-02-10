@@ -45,7 +45,7 @@ CUTOFF_DATE = datetime.now() - timedelta(days=DAYS_TO_SCRAPE)
 # =============================================================================
 # DYNAMIC DATE FUNCTIONS (for daily batch mode)
 # =============================================================================
-COLLECTION_WINDOW_DAYS = 7  # 최근 7일간 리뷰 수집
+COLLECTION_WINDOW_DAYS = 3  # 최근 3일간 리뷰 수집
 
 def get_yesterday_kst():
     now_kst = datetime.now(KST)
@@ -142,6 +142,13 @@ AMAZON_BASE_URL = 'https://www.amazon.com'
 REVIEWS_URL_TEMPLATE = f'{AMAZON_BASE_URL}/product-reviews/{ASIN}/ref=cm_cr_arp_d_paging_btm_next_{{page}}?pageNumber={{page}}&sortBy=recent'
 LOGIN_URL = f'{AMAZON_BASE_URL}/ap/signin'
 PRODUCT_URL = f'{AMAZON_BASE_URL}/dp/{ASIN}'
+
+# =============================================================================
+# GOOGLE SHEETS
+# =============================================================================
+GOOGLE_SHEETS_URL = 'https://docs.google.com/spreadsheets/d/1NVUVShv5tAveINA9DdB2D21z71L3tF0In5JVK6LYX9s/edit'
+SHEET_NAME = 'US_amazone'
+PRODUCTS_CSV = 'config/products.csv'
 
 # =============================================================================
 # SLACK CONFIGURATION

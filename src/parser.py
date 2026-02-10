@@ -101,10 +101,30 @@ class ReviewParser:
         helpful_elem = elem.select_one('[data-hook="helpful-vote-statement"]')
         helpful_count = self._parse_helpful_count(helpful_elem)
         
-        # Images
+        # Images - extract full-size URLs
         image_elems = elem.select('img.review-image-tile')
-        image_count = len(image_elems)
-        
+        image_urls = []
+        for img in image_elems:
+            src = img.get('src', '')
+            if src:
+                # 썸네일(_SY88, _SX88 등)을 원본 사이즈로 변환
+                full_url = re.sub(r'\._[A-Z]{2}\d+_?\.', '.', src)
+                image_urls.append(full_url)
+        image_count = len(image_urls)
+
+        # Videos
+        video_urls = []
+        video_elems = elem.select('input.video-url, [data-hook="review-video-tile"]')
+        for vid in video_elems:
+            url = vid.get('value', '') or vid.get('src', '') or vid.get('data-src', '')
+            if url:
+                video_urls.append(url)
+        # 대안: video 태그의 source
+        for source in elem.select('video source'):
+            url = source.get('src', '')
+            if url and url not in video_urls:
+                video_urls.append(url)
+
         return {
             'review_id': review_id,
             'rating': rating,
@@ -117,6 +137,8 @@ class ReviewParser:
             'content': content,
             'helpful_count': helpful_count,
             'image_count': image_count,
+            'image_urls': '|'.join(image_urls),
+            'video_urls': '|'.join(video_urls),
             'scraped_at': datetime.now().isoformat()
         }
     
