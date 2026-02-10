@@ -7,6 +7,7 @@ US/UK 통합 스크립트.
 Usage:
     python daily_scraper.py --region us              # US 전체
     python daily_scraper.py --region uk              # UK 전체
+    python daily_scraper.py --region all             # US + UK 순차 실행
     python daily_scraper.py --region uk --test       # UK 테스트 (10페이지)
     python daily_scraper.py --region us --limit 3    # US 3개만
 """
@@ -220,10 +221,20 @@ async def main():
         if idx + 1 < len(sys.argv):
             limit = int(sys.argv[idx + 1])
 
-    if region not in ('us', 'uk'):
-        print(f"Invalid region: {region}. Use 'us' or 'uk'.")
+    if region not in ('us', 'uk', 'all'):
+        print(f"Invalid region: {region}. Use 'us', 'uk', or 'all'.")
         sys.exit(1)
 
+    if region == 'all':
+        for r in ('us', 'uk'):
+            await run_region(r, test_mode, limit)
+        return
+
+    await run_region(region, test_mode, limit)
+
+
+async def run_region(region: str, test_mode: bool, limit: int | None):
+    """단일 region 스크래핑 실행."""
     # 설정 로드
     cfg = load_config(region)
 

@@ -536,14 +536,24 @@ class BrowserSession:
                 error_count = 0
 
                 # "Next page" 버튼 클릭으로 다음 페이지 이동
+                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
                 next_link = await page.query_selector('li.a-last a')
                 if not next_link:
                     print(f"   No next page button. End reached.")
                     break
 
-                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-                await next_link.click()
-                await page.wait_for_load_state('networkidle', timeout=30000)
+                try:
+                    await next_link.click()
+                    await page.wait_for_load_state('networkidle', timeout=30000)
+                except Exception:
+                    # DOM 갱신으로 element 참조 무효화 시 selector로 재시도
+                    next_link = await page.query_selector('li.a-last a')
+                    if next_link:
+                        await next_link.click()
+                        await page.wait_for_load_state('networkidle', timeout=30000)
+                    else:
+                        print(f"   No next page button after retry. End reached.")
+                        break
 
             except Exception as e:
                 error_count += 1
