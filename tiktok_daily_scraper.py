@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 
 from scrapers.tiktok import TikTokShopScraper
@@ -107,10 +108,15 @@ def publish_to_sheets(result: dict) -> dict:
 
 async def main():
     """메인 실행 함수"""
+    start_time = time.time()
+
     logger.info("=" * 80)
     logger.info("TikTok Shop Daily Review Scraper 시작")
     logger.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
+
+    start_date, end_date = get_tiktok_collection_date_range()
+    date_str = f"{start_date} ~ {end_date}"
 
     # 1. 리뷰 수집
     scrape_result = await scrape_tiktok_reviews()
@@ -122,6 +128,8 @@ async def main():
     else:
         logger.warning(f"스크래핑 실패: {scrape_result.get('error', 'Unknown')}")
 
+    elapsed = time.time() - start_time
+
     # 3. 최종 요약
     logger.info("\n" + "=" * 80)
     logger.info("최종 요약")
@@ -132,6 +140,31 @@ async def main():
     logger.info("=" * 80)
     logger.info("TikTok Shop Daily Review Scraper 완료")
     logger.info("=" * 80)
+
+    # 4. Slack 알림
+    try:
+        from src.slack_notifier import SlackNotifier
+        slack = SlackNotifier()
+
+        total_reviews = scrape_result.get('total_reviews', 0)
+        status = scrape_result.get('status', 'failed')
+        error_msg = scrape_result.get('error', '')
+        new_count = publish_result.get('appended_reviews', 0)
+
+        slack_results = [{
+            'product_name': f'US (+{new_count} new)',
+            'review_count': total_reviews,
+            'status': status,
+            'error_message': error_msg if status != 'success' else '',
+        }]
+
+        slack.send_daily_scrape_report(
+            date_str, slack_results, elapsed,
+            channel_name='TikTok Shop',
+        )
+        logger.info("Slack 알림 전송 완료")
+    except Exception as e:
+        logger.error(f"Slack 알림 실패: {e}")
 
     return {
         "scrape": scrape_result,

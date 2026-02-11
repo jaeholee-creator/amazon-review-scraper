@@ -169,7 +169,12 @@ class TikTokShopScraper:
         return await self._do_login()
 
     async def _is_logged_in(self) -> bool:
-        """현재 페이지에서 로그인 상태 확인"""
+        """현재 페이지에서 로그인 상태 확인 (URL + 페이지 콘텐츠 기반).
+
+        중요: URL 패턴만으로 판단하지 않는다. TikTok은 미인증 상태에서도
+        /product/rating URL을 유지하면서 공개 마케팅 페이지를 보여줄 수 있다.
+        반드시 페이지 콘텐츠도 함께 검증한다.
+        """
         page = self._page
         current_url = page.url
 
@@ -177,18 +182,52 @@ class TikTokShopScraper:
         if "/account/login" in current_url or "/account/register" in current_url:
             return False
 
-        # 내부 페이지 URL 패턴이면 로그인 성공
-        logged_in_paths = ["/homepage", "/product/", "/order/", "/dashboard", "/finance/"]
-        for path in logged_in_paths:
-            if path in current_url:
-                return True
+        # 페이지 콘텐츠 기반 확인 (공개 페이지 vs 인증 페이지 구분)
+        try:
+            body_text = await page.evaluate("() => document.body.innerText.substring(0, 1000)")
 
-        # seller-us.tiktok.com에 있지만 위 패턴이 아닌 경우 → 비밀번호 입력창으로 판단
-        if "seller-us.tiktok.com" in current_url:
-            password_input = await page.query_selector('input[type="password"]')
-            if password_input:
+            # 공개 마케팅 페이지 감지 (복수 시그널)
+            public_signals = ["Join now", "Sign up", "Get $", "New Seller Rewards"]
+            public_count = sum(1 for s in public_signals if s in body_text)
+            if public_count >= 2:
+                logger.info(f"공개 페이지 감지 (미로그인, 시그널={public_count}). URL: {current_url}")
                 return False
+
+            # 로그인 폼 감지
+            if "Log in" in body_text and "Forgot the password" in body_text:
+                logger.info(f"로그인 폼 감지 (미로그인). URL: {current_url}")
+                return False
+        except Exception:
+            pass
+
+        # 비밀번호 입력창이 있으면 미로그인
+        password_input = await page.query_selector('input[type="password"]')
+        if password_input:
+            return False
+
+        # Seller Center 인증 요소 확인 (사이드바 네비게이션 등)
+        # 이것이 있으면 확실히 로그인 상태
+        seller_indicators = await page.query_selector(
+            '[class*="sidebar"], [class*="Sidebar"], '
+            '[class*="navigation"], [class*="Navigation"], '
+            '[class*="shopName"], [class*="ShopName"]'
+        )
+        if seller_indicators:
             return True
+
+        # URL 패턴 + 페이지 길이 기반 판단
+        # 인증된 Seller Center 페이지는 최소 5000자 이상의 콘텐츠를 가짐
+        if "seller-us.tiktok.com" in current_url:
+            logged_in_paths = ["/homepage", "/product/", "/order/", "/dashboard", "/finance/"]
+            for path in logged_in_paths:
+                if path in current_url:
+                    try:
+                        body_len = await page.evaluate("() => document.body.innerText.length")
+                        if body_len > 5000:
+                            return True
+                        logger.debug(f"URL 매칭이지만 콘텐츠 짧음 ({body_len}자). 미인증 가능.")
+                    except Exception:
+                        pass
 
         return False
 
@@ -244,10 +283,18 @@ class TikTokShopScraper:
                 logger.error("비밀번호 입력 필드를 찾을 수 없음")
                 return False
 
-            # 로그인 버튼 클릭
-            login_button = await page.query_selector(
-                'button[type="submit"], button:has-text("Log in"), button:has-text("Continue")'
-            )
+            # 로그인 버튼 클릭 ("Continue" 버튼이 실제 제출 버튼)
+            # 주의: button:has-text("Log in")은 "Log in with Google" 등을 먼저 매칭할 수 있음
+            login_button = None
+            for btn_sel in [
+                'button:has-text("Continue")',
+                'button[type="submit"]',
+            ]:
+                login_button = await page.query_selector(btn_sel)
+                if login_button:
+                    logger.info(f"로그인 버튼 발견: {btn_sel}")
+                    break
+
             if login_button:
                 await login_button.click()
                 logger.info("로그인 버튼 클릭")
@@ -259,25 +306,54 @@ class TikTokShopScraper:
             await page.wait_for_timeout(5000)
             logger.info(f"로그인 버튼 클릭 후 URL: {page.url}")
 
-            # 캡차 처리 (슬라이더 퍼즐 캡차가 나타날 수 있음)
-            captcha_passed = await self._handle_captcha()
+            # 캡차 + 인증 코드 반복 처리 (캡차가 여러 번 나올 수 있음)
+            for captcha_round in range(3):
+                # 캡차 처리 (슬라이더 퍼즐 캡차가 나타날 수 있음)
+                captcha_passed = await self._handle_captcha()
 
-            if not captcha_passed:
-                if not self.headless:
-                    # headed 모드: 수동 캡차 풀기 대기 (최대 60초)
-                    logger.info("캡차를 수동으로 풀어주세요 (최대 60초 대기)")
-                    for _ in range(12):
-                        await page.wait_for_timeout(5000)
-                        if await self._needs_verification() or await self._is_logged_in():
-                            break
-                else:
-                    logger.error("Headless 모드에서 캡차 자동 풀기 실패")
-                    return False
+                if not captcha_passed:
+                    if not self.headless:
+                        logger.info("캡차를 수동으로 풀어주세요 (최대 60초 대기)")
+                        for _ in range(12):
+                            await page.wait_for_timeout(5000)
+                            if await self._needs_verification() or await self._is_logged_in():
+                                break
+                    else:
+                        logger.error("Headless 모드에서 캡차 자동 풀기 실패")
+                        return False
 
-            # 캡차 후 페이지 전환 대기
-            await page.wait_for_timeout(3000)
-            logger.info(f"캡차 처리 후 URL: {page.url}")
+                # 캡차 후 페이지 전환 대기
+                await page.wait_for_timeout(3000)
+                current_url = page.url
+                logger.info(f"캡차 라운드 {captcha_round + 1} 완료. URL: {current_url}")
 
+                # 캡차 후 실제로 페이지가 전환되었는지 확인
+                if "/account/login" not in current_url:
+                    break
+
+                # 여전히 로그인 페이지 → 캡차가 실제로 안 풀린 것
+                # 페이지에 캡차가 남아있는지 확인
+                has_captcha_text = False
+                try:
+                    body = await page.evaluate("() => document.body.innerText")
+                    has_captcha_text = "Drag the slider" in body or "drag the slider" in body
+                except Exception:
+                    pass
+
+                if has_captcha_text:
+                    logger.warning(f"캡차가 여전히 존재 (라운드 {captcha_round + 1}). 재시도...")
+                    await page.wait_for_timeout(2000)
+                    continue
+
+                # 인증 코드 확인
+                if await self._needs_verification():
+                    break
+                # 짧은 대기 후 다시 확인
+                await page.wait_for_timeout(3000)
+
+            logger.info(f"캡차 처리 후 최종 URL: {page.url}")
+
+            # 인증 코드 처리
             if await self._needs_verification():
                 logger.info("이메일 인증 코드 필요 - 대기 중...")
                 verified = await self._wait_for_verification(timeout=300)
@@ -286,7 +362,7 @@ class TikTokShopScraper:
                     return False
 
             # 로그인 완료 대기 (SSO 리다이렉트 포함)
-            for i in range(6):
+            for i in range(10):
                 await page.wait_for_timeout(3000)
                 current_url = page.url
 
@@ -303,17 +379,26 @@ class TikTokShopScraper:
                 if await self._is_logged_in():
                     logger.info("로그인 성공!")
                     return True
+
+                # 여전히 로그인 페이지에서 인증 코드가 새로 나타났을 수 있음
+                if "/account/login" in current_url and await self._needs_verification():
+                    logger.info("로그인 대기 중 인증 코드 감지")
+                    verified = await self._wait_for_verification(timeout=300)
+                    if verified:
+                        continue
+
                 logger.info(f"  로그인 대기 중... URL: {current_url[:80]}")
 
             # Rating 페이지로 직접 이동 시도
             await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(8000)  # 충분히 대기
 
             if await self._is_logged_in():
                 logger.info("로그인 성공! (Rating 페이지 이동 후)")
                 return True
 
             logger.error(f"로그인 후에도 인증 확인 실패. URL: {page.url}")
+            await page.screenshot(path=f"{self.data_dir}/debug_login_failed.png", full_page=True)
             return False
 
         except Exception as e:
@@ -355,35 +440,26 @@ class TikTokShopScraper:
             return True
 
     async def _dismiss_popups(self):
-        """공지사항, 알림, 모달 등의 팝업을 자동으로 닫기"""
+        """공지사항, 알림, 모달 등의 팝업을 안전하게 닫기.
+
+        주의: 광범위한 CSS 셀렉터는 로그아웃/세션종료 버튼을 오클릭할 수 있으므로
+        Arco Design 모달과 명확한 텍스트 버튼만 대상으로 한다.
+        """
         page = self._page
+        url_before = page.url
         try:
-            # 일반적인 닫기 버튼 패턴들
-            close_selectors = [
-                # 모달/다이얼로그 닫기 버튼
-                'button[aria-label="Close"]',
-                'button[aria-label="close"]',
-                '[class*="modal"] [class*="close"]',
-                '[class*="dialog"] [class*="close"]',
-                '[class*="announcement"] [class*="close"]',
-                '[class*="notice"] [class*="close"]',
-                '[class*="popup"] [class*="close"]',
-                # Arco Design 모달 닫기
+            # 안전한 셀렉터만 사용 (광범위한 [class*="close"] 제거)
+            safe_selectors = [
+                # Arco Design 모달 닫기 (TikTok Seller Center 주력 UI)
                 '.arco-modal-close-icon',
-                '.arco-icon-close',
-                # TikTok 특유의 닫기 패턴
-                '[class*="CloseButton"]',
-                '[class*="closeBtn"]',
-                # 일반적인 "Got it", "OK", "I understand" 버튼
+                # 명확한 텍스트 버튼
                 'button:has-text("Got it")',
-                'button:has-text("OK")',
                 'button:has-text("I understand")',
-                'button:has-text("Confirm")',
                 'button:has-text("Dismiss")',
             ]
 
             dismissed = 0
-            for selector in close_selectors:
+            for selector in safe_selectors:
                 try:
                     elements = await page.query_selector_all(selector)
                     for el in elements:
@@ -391,16 +467,16 @@ class TikTokShopScraper:
                             await el.click()
                             dismissed += 1
                             await page.wait_for_timeout(500)
+                            # 클릭 후 URL이 바뀌었으면 즉시 중단
+                            if page.url != url_before:
+                                logger.warning(f"팝업 클릭으로 URL 변경 감지: {page.url}")
+                                return
                 except Exception:
                     pass
 
-            # 버튼으로 닫지 못한 경우 ESC 키 시도 (Arco Design 모달은 ESC로 닫힘)
+            # Arco 모달이 남아있으면 ESC 시도
             if dismissed == 0:
-                # 모달/오버레이가 있는지 확인
-                modal = await page.query_selector(
-                    '.arco-modal-wrapper, [class*="modal"], [class*="dialog"], '
-                    '[class*="announcement"], [class*="popup"]'
-                )
+                modal = await page.query_selector('.arco-modal-wrapper')
                 if modal and await modal.is_visible():
                     await page.keyboard.press("Escape")
                     dismissed += 1
@@ -629,15 +705,35 @@ class TikTokShopScraper:
         else:
             logger.info("이미 Rating 페이지에 있음 - 네비게이션 건너뜀")
 
-        # 공지사항/알림 팝업 닫기
+        # 공지사항/알림 팝업 닫기 (안전한 셀렉터만 사용)
         await self._dismiss_popups()
+
+        # 팝업 처리 후 URL 변경 감지 → 재이동
+        current_url = page.url
+        if "/product/rating" not in current_url:
+            if "/account/login" in current_url or "/account/register" in current_url:
+                logger.error(f"팝업 처리 후 세션 만료. URL: {current_url}")
+                return all_reviews
+            logger.warning(f"Rating 페이지 이탈 감지. 재이동. URL: {current_url}")
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
 
         # Rating 페이지에서도 캡차가 나올 수 있음
         await self._handle_captcha()
 
-        # 로그인 상태 재확인
+        # 캡차 처리 후에도 URL 변경 감지
+        current_url = page.url
+        if "/account/login" in current_url or "/account/register" in current_url:
+            logger.error(f"캡차 처리 후 세션 만료. URL: {current_url}")
+            return all_reviews
+        if "/product/rating" not in current_url:
+            logger.warning(f"캡차 후 Rating 이탈. 재이동. URL: {current_url}")
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+        # 최종 로그인 상태 확인
         if not await self._is_logged_in():
-            logger.error("세션 만료. 재로그인 필요.")
+            logger.error(f"세션 만료. URL: {page.url}")
             return all_reviews
 
         for page_num in range(1, max_pages + 1):

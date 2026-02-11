@@ -19,7 +19,12 @@ from bs4 import BeautifulSoup
 
 from src.parser import ReviewParser
 
-# CAPTCHA는 수동 해결 (manual_login.py)
+# TOTP 자동 OTP 생성
+try:
+    import pyotp
+    HAS_PYOTP = True
+except ImportError:
+    HAS_PYOTP = False
 
 
 class BrowserSession:
@@ -62,6 +67,9 @@ class BrowserSession:
 
         self._cookies_file = f'{self._data_dir}/cookies_{self._region}.json'
 
+        # TOTP 시크릿 로드 (Amazon 2FA 자동 OTP)
+        self._totp_secret = os.getenv('AMAZON_TOTP_SECRET', '').replace(' ', '')
+
         self._playwright = None
         self._browser = None
         self._context: BrowserContext | None = None
@@ -77,7 +85,10 @@ class BrowserSession:
     async def start(self):
         """Playwright Firefox 시작 + 단일 Page 생성."""
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.firefox.launch(headless=True)
+        self._browser = await self._playwright.chromium.launch(
+            headless=True,
+            args=['--disable-dev-shm-usage', '--no-sandbox'],
+        )
         self._context = await self._browser.new_context(
             viewport={'width': 1920, 'height': 1080},
             locale=self._locale,
@@ -85,7 +96,7 @@ class BrowserSession:
         )
         self._page = await self._context.new_page()  # 유일한 new_page()
         self._page.on('request', self._on_request)   # 1회만 등록
-        print(f"   Browser started (Firefox, {self._region.upper()}, single page)")
+        print(f"   Browser started (Chromium, {self._region.upper()}, single page)")
 
     async def close(self):
         """브라우저 리소스 정리."""
@@ -251,11 +262,31 @@ class BrowserSession:
             await page.wait_for_timeout(4000)
             print(f"   After signin URL: {page.url}")
 
-            # OTP/2FA 처리
-            otp_field = await page.query_selector('#auth-mfa-otpcode, #ap_dcq_hint, input[name="otpCode"]')
+            # OTP/2FA 자동 처리 (pyotp + TOTP 시크릿)
+            otp_field = await page.query_selector('#auth-mfa-otpcode, input[name="otpCode"]')
             if otp_field:
-                print("   2FA/OTP required - saving screenshot")
-                await page.screenshot(path=f'{self._data_dir}/debug_2fa.png')
+                if HAS_PYOTP and self._totp_secret:
+                    totp = pyotp.TOTP(self._totp_secret)
+                    otp_code = totp.now()
+                    print(f"   2FA detected - auto-entering OTP: {otp_code}")
+                    await otp_field.fill(otp_code)
+
+                    # "Don't require OTP on this browser" 체크박스
+                    remember_cb = await page.query_selector('#auth-mfa-remember-device, input[name="rememberDevice"]')
+                    if remember_cb:
+                        await remember_cb.check()
+                        print("   Checked 'remember device'")
+
+                    # Submit OTP
+                    submit_btn = await page.query_selector('#auth-signin-button, button[type="submit"]')
+                    if submit_btn:
+                        await submit_btn.click()
+                        await page.wait_for_timeout(4000)
+                        print(f"   OTP submitted. URL: {page.url}")
+                else:
+                    print("   2FA/OTP required but no TOTP secret configured")
+                    await page.screenshot(path=f'{self._data_dir}/debug_2fa.png')
+                    return False
 
             # "approve notification" 처리 (앱 승인 요청)
             approve_text = await page.query_selector('text="Approve the notification"')

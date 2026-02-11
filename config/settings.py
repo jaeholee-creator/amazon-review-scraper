@@ -22,11 +22,10 @@ AMAZON_EMAIL = os.getenv('AMAZON_EMAIL', '')
 AMAZON_PASSWORD = os.getenv('AMAZON_PASSWORD', '')
 
 if not AMAZON_EMAIL or not AMAZON_PASSWORD:
-    raise ValueError(
-        "Missing Amazon credentials!\n"
-        "Please create a .env file with:\n"
-        "  AMAZON_EMAIL=your_email@example.com\n"
-        "  AMAZON_PASSWORD=your_password"
+    import logging
+    logging.getLogger(__name__).warning(
+        "Amazon credentials not set. Amazon US scraper will not work. "
+        "Set AMAZON_EMAIL and AMAZON_PASSWORD in .env or environment variables."
     )
 
 # =============================================================================

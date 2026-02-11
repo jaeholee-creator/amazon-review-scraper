@@ -11,6 +11,7 @@ Biodance 제품 리뷰 증분 수집 스크립트
 import logging
 import os
 import sys
+import time
 
 # 프로젝트 루트를 sys.path에 추가
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,6 +36,8 @@ DATA_DIR = os.path.join(project_root, "data", "biodance")
 
 
 def main():
+    start_time = time.time()
+
     crawler = BiodanceReviewCrawler()
     json_path = os.path.join(DATA_DIR, "biodance_reviews_all.json")
 
@@ -118,6 +121,32 @@ def main():
     if save_local:
         logger.info("JSON: %s", json_path)
         logger.info("CSV:  %s", csv_path)
+
+    elapsed = time.time() - start_time
+
+    # Slack 알림
+    try:
+        from src.slack_notifier import SlackNotifier
+        slack = SlackNotifier()
+
+        from datetime import datetime
+        date_str = datetime.now().strftime('%Y-%m-%d')
+
+        slack_results = []
+        for product in results["products"]:
+            slack_results.append({
+                'product_name': product["product_name"],
+                'review_count': len(product["reviews"]),
+                'status': 'success',
+            })
+
+        slack.send_daily_scrape_report(
+            date_str, slack_results, elapsed,
+            channel_name='Biodance',
+        )
+        logger.info("Slack 알림 전송 완료")
+    except Exception as e:
+        logger.error(f"Slack 알림 실패: {e}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ Shopee Daily Review Scraper
 """
 import logging
 import sys
+import time
 from datetime import datetime
 
 from scrapers.shopee import ShopeeScraper
@@ -12,7 +13,7 @@ from publishers.shopee_sheets_publisher import ShopeeGoogleSheetsPublisher
 from config.settings import (
     SHOPEE_SHOPS,
     SHOPEE_SPREADSHEET_ID,
-    get_shopee_collection_date_range
+    get_shopee_collection_date_range,
 )
 
 # 로깅 설정
@@ -108,16 +109,20 @@ def publish_to_sheets(country_code: str, result: dict) -> dict:
 
 def main():
     """메인 실행 함수"""
+    start_time = time.time()
+
     logger.info("=" * 80)
     logger.info("Shopee Daily Review Scraper 시작")
     logger.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
+    start_date, end_date = get_shopee_collection_date_range()
+    date_str = f"{start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}"
     results = {}
 
     # Singapore 수집
     logger.info("\n" + "=" * 80)
-    logger.info("🇸🇬 Singapore 리뷰 수집")
+    logger.info("Singapore 리뷰 수집")
     logger.info("=" * 80)
     sg_result = scrape_shopee_country('sg')
     if sg_result:
@@ -129,7 +134,7 @@ def main():
 
     # Philippines 수집
     logger.info("\n" + "=" * 80)
-    logger.info("🇵🇭 Philippines 리뷰 수집")
+    logger.info("Philippines 리뷰 수집")
     logger.info("=" * 80)
     ph_result = scrape_shopee_country('ph')
     if ph_result:
@@ -139,9 +144,11 @@ def main():
             'publish': ph_publish
         }
 
+    elapsed = time.time() - start_time
+
     # 최종 요약
     logger.info("\n" + "=" * 80)
-    logger.info("📊 최종 요약")
+    logger.info("최종 요약")
     logger.info("=" * 80)
 
     for country, data in results.items():
@@ -153,8 +160,36 @@ def main():
         logger.info(f"  - 업로드: {publish_data.get('appended_reviews', 0)}개 신규")
 
     logger.info("=" * 80)
-    logger.info("✅ Shopee Daily Review Scraper 완료")
+    logger.info("Shopee Daily Review Scraper 완료")
     logger.info("=" * 80)
+
+    # Slack 알림
+    try:
+        from src.slack_notifier import SlackNotifier
+        slack = SlackNotifier()
+
+        # Shopee: 국가별로 제품 수와 리뷰 수 표시
+        slack_results = []
+        for country, data in results.items():
+            scrape_data = data.get('scrape', {})
+            reviews = scrape_data.get('reviews', [])
+            review_count = len(reviews)
+            unique_products = len(set(r.get('product_name', '') for r in reviews if r.get('product_name')))
+            publish_data = data.get('publish', {})
+            new_count = publish_data.get('appended_reviews', 0)
+            slack_results.append({
+                'product_name': f'{country.upper()} - {unique_products}개 제품 (+{new_count} new)',
+                'review_count': review_count,
+                'status': 'success' if review_count >= 0 else 'failed',
+            })
+
+        slack.send_daily_scrape_report(
+            date_str, slack_results, elapsed,
+            channel_name='Shopee',
+        )
+        logger.info("Slack 알림 전송 완료")
+    except Exception as e:
+        logger.error(f"Slack 알림 실패: {e}")
 
     return results
 

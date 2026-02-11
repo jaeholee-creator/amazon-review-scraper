@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class TikTokCaptchaSolver:
     """TikTok 슬라이더 퍼즐 캡차 자동 풀기"""
 
-    MAX_RETRIES = 3
+    MAX_RETRIES = 5
 
     # DOM 셀렉터
     CONTAINER_SEL = ".captcha-verify-container"
@@ -34,17 +34,27 @@ class TikTokCaptchaSolver:
         self.page = page
 
     async def is_captcha_visible(self) -> bool:
-        """슬라이더 캡차가 화면에 표시되어 있는지 확인 (슬라이더 트랙 존재 여부로 판단)"""
-        # 컨테이너가 아닌 슬라이더 트랙으로 확인 (인증 코드 페이지와 구분)
+        """슬라이더 캡차가 화면에 표시되어 있는지 확인."""
+        # CSS 셀렉터 기반 확인
         slider = await self.page.query_selector(self.SLIDER_TRACK_SEL)
         if slider:
             return True
-        # 퍼즐 이미지로도 확인
         bg_img = await self.page.query_selector(self.BG_IMAGE_SEL)
-        return bg_img is not None
+        if bg_img:
+            return True
+        # 텍스트 기반 확인 (셀렉터가 변경되었을 수 있으므로 폴백)
+        try:
+            body_text = await self.page.evaluate("() => document.body.innerText")
+            if "Drag the slider" in body_text or "drag the slider" in body_text:
+                return True
+        except Exception:
+            pass
+        return False
 
     async def solve(self) -> bool:
-        """캡차 풀기 (최대 MAX_RETRIES번 시도)"""
+        """캡차 풀기 (최대 MAX_RETRIES번 시도). 실패 시 오프셋 지터 적용."""
+        self._jitter_offset = 0.0  # 재시도 시 적용할 오프셋
+
         for attempt in range(1, self.MAX_RETRIES + 1):
             if not await self.is_captcha_visible():
                 logger.info("캡차가 없음 - 통과")
@@ -56,7 +66,6 @@ class TikTokCaptchaSolver:
                 success = await self._attempt_solve()
 
                 if not success:
-                    # 요소를 못 찾은 경우 - 이미 캡차가 사라졌을 수 있음
                     await asyncio.sleep(1)
                     if not await self.is_captcha_visible():
                         logger.info("캡차 풀기 성공! (요소 소멸 확인)")
@@ -64,18 +73,26 @@ class TikTokCaptchaSolver:
                     logger.info("캡차 풀기 실패 - 리프레시 후 재시도")
                     await self._refresh()
                     await asyncio.sleep(2)
+                    # 재시도마다 오프셋 변경
+                    self._jitter_offset = random.uniform(-0.05, 0.05) * attempt
                     continue
 
-                # 드래그 후 서버 검증 대기 (점진적 확인)
-                for wait_i in range(5):
-                    await asyncio.sleep(1)
+                # 드래그 후 서버 검증 대기
+                for wait_i in range(6):
+                    await asyncio.sleep(1.5)
                     if not await self.is_captcha_visible():
-                        logger.info(f"캡차 풀기 성공! ({wait_i + 1}초 후 확인)")
-                        return True
+                        await asyncio.sleep(2)
+                        if not await self.is_captcha_visible():
+                            logger.info(f"캡차 풀기 성공! ({wait_i + 1}회차 확인)")
+                            return True
+                        logger.info("캡차가 잠깐 사라졌다가 재표시됨 - 재시도 필요")
+                        break
 
                 logger.info("드래그 후 캡차 여전히 표시 - 리프레시 후 재시도")
                 await self._refresh()
                 await asyncio.sleep(2)
+                # 재시도마다 오프셋 변경
+                self._jitter_offset = random.uniform(-0.05, 0.05) * attempt
 
             except Exception as e:
                 logger.warning(f"캡차 풀기 시도 {attempt} 오류: {e}")
@@ -84,6 +101,7 @@ class TikTokCaptchaSolver:
                     return True
                 await self._refresh()
                 await asyncio.sleep(2)
+                self._jitter_offset = random.uniform(-0.05, 0.05) * attempt
 
         logger.error(f"캡차 풀기 최종 실패 ({self.MAX_RETRIES}번 시도)")
         return False
@@ -112,12 +130,19 @@ class TikTokCaptchaSolver:
         # 2. 퍼즐 이미지 분석하여 타겟 위치 계산
         target_ratio = await self._analyze_puzzle_images()
 
+        # 재시도 시 지터 오프셋 적용
+        jitter = getattr(self, '_jitter_offset', 0.0)
+
         if target_ratio is not None:
-            drag_distance = int(usable_width * target_ratio)
-            logger.info(f"이미지 분석 결과: ratio={target_ratio:.2f}, drag={drag_distance}px")
+            adjusted_ratio = max(0.05, min(0.95, target_ratio + jitter))
+            drag_distance = int(usable_width * adjusted_ratio)
+            logger.info(
+                f"이미지 분석 결과: ratio={target_ratio:.2f}, "
+                f"jitter={jitter:+.2f}, adjusted={adjusted_ratio:.2f}, drag={drag_distance}px"
+            )
         else:
             # 분석 실패 시 랜덤 오프셋
-            target_ratio = random.uniform(0.3, 0.7)
+            target_ratio = random.uniform(0.2, 0.7)
             drag_distance = int(usable_width * target_ratio)
             logger.info(f"이미지 분석 실패, 랜덤 시도: ratio={target_ratio:.2f}, drag={drag_distance}px")
 
@@ -182,58 +207,118 @@ class TikTokCaptchaSolver:
 
     @staticmethod
     def _find_gap_position(
-        bg_image: Image.Image, _piece_image: Image.Image
+        bg_image: Image.Image, piece_image: Image.Image
     ) -> Optional[float]:
         """
-        배경 이미지에서 퍼즐 갭의 x 위치를 비율로 반환합니다.
+        원형 퍼즐 배경 이미지에서 갭(빠진 조각)의 x 위치를 비율로 반환합니다.
 
-        배경 이미지의 에지를 분석하여 퍼즐 조각이 빠진 갭의 위치를 찾습니다.
+        TikTok 캡차는 원형 퍼즐이므로:
+        1. 원형 테두리의 에지를 제외하고 내부만 분석
+        2. 갭은 배경색(밝은 회색)이 보이는 영역 → 주변보다 밝기가 다름
+        3. 열별 밝기 이상치를 탐지하여 갭 위치 결정
         """
         try:
-            # 그레이스케일 변환
             bg_gray = bg_image.convert("L")
+            width, height = bg_gray.size
+            cx, cy = width // 2, height // 2
+            radius = min(width, height) // 2 - 2
 
-            # 에지 디텍션
-            edges = bg_gray.filter(ImageFilter.FIND_EDGES)
+            # 1. 원형 마스크 내부에서 열별 평균 밝기 계산
+            col_brightness = []
+            col_pixel_count = []
+            inner_radius = radius * 0.80  # 테두리 20% 제외
 
-            width, height = edges.size
-
-            # 원형 이미지이므로 중앙 영역만 분석 (상하 20% 제외)
-            y_start = int(height * 0.2)
-            y_end = int(height * 0.8)
-
-            # 열별 에지 강도 합산
-            col_edge_sums = []
             for x in range(width):
-                col_sum = 0
-                for y in range(y_start, y_end):
-                    col_sum += edges.getpixel((x, y))
-                col_edge_sums.append(col_sum)
+                brightness_sum = 0
+                pixel_count = 0
+                for y in range(height):
+                    dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+                    if dist < inner_radius:
+                        brightness_sum += bg_gray.getpixel((x, y))
+                        pixel_count += 1
+                if pixel_count > 0:
+                    col_brightness.append(brightness_sum / pixel_count)
+                else:
+                    col_brightness.append(0)
+                col_pixel_count.append(pixel_count)
 
-            # 퍼즐 조각 크기 비율 (퍼즐은 보통 배경의 60% 크기)
-            piece_width_ratio = 0.6
+            # 유효한 열만 선택 (충분한 픽셀이 있는 열)
+            min_pixels = max(col_pixel_count) * 0.3
+            valid_cols = [i for i in range(width) if col_pixel_count[i] > min_pixels]
+            if not valid_cols:
+                return None
 
-            # 갭은 보통 배경의 왼쪽 20% 이후에 위치 (슬라이더 시작점 제외)
-            search_start = int(width * 0.2)
-            search_end = int(width * 0.85)
+            # 2. 열별 밝기의 로컬 이상치 탐지
+            # 갭은 주변 열과 밝기가 크게 다른 영역
+            window = max(3, int(width * 0.06))
+            search_start = valid_cols[0] + window
+            search_end = valid_cols[-1] - window
 
-            # 검색 범위 내에서 에지 강도가 가장 높은 구간 찾기
-            # (갭의 경계에서 에지가 강하게 나타남)
-            window_size = int(width * piece_width_ratio * 0.15)  # 윈도우 크기
-            max_sum = 0
+            max_anomaly = 0
             max_pos = search_start
+            anomaly_scores = []
 
-            for x in range(search_start, search_end - window_size):
-                window_sum = sum(col_edge_sums[x : x + window_size])
-                if window_sum > max_sum:
-                    max_sum = window_sum
+            for x in range(search_start, search_end):
+                if col_pixel_count[x] < min_pixels:
+                    anomaly_scores.append(0)
+                    continue
+
+                # 현재 열의 밝기
+                current = col_brightness[x]
+
+                # 주변 열의 평균 밝기 (좌우 window 범위, 현재 열 제외)
+                left_vals = [col_brightness[i] for i in range(max(0, x - window * 2), x - window // 2)
+                             if col_pixel_count[i] > min_pixels]
+                right_vals = [col_brightness[i] for i in range(x + window // 2, min(width, x + window * 2))
+                              if col_pixel_count[i] > min_pixels]
+
+                if not left_vals or not right_vals:
+                    anomaly_scores.append(0)
+                    continue
+
+                surround_avg = (sum(left_vals) + sum(right_vals)) / (len(left_vals) + len(right_vals))
+                anomaly = abs(current - surround_avg)
+                anomaly_scores.append(anomaly)
+
+                if anomaly > max_anomaly:
+                    max_anomaly = anomaly
                     max_pos = x
 
-            # 갭 중심의 x 비율 반환
-            gap_center = max_pos + window_size // 2
+            # 3. 이상치가 충분히 큰 연속 영역의 중심을 갭 위치로 결정
+            if max_anomaly < 3:
+                logger.warning(f"밝기 이상치가 너무 작음: {max_anomaly:.1f}")
+                return None
+
+            # 임계값: 최대 이상치의 40%
+            threshold = max_anomaly * 0.4
+            gap_cols = []
+            for i, score in enumerate(anomaly_scores):
+                if score >= threshold:
+                    gap_cols.append(search_start + i)
+
+            if not gap_cols:
+                return None
+
+            # 가장 큰 연속 구간 찾기
+            groups = []
+            current_group = [gap_cols[0]]
+            for i in range(1, len(gap_cols)):
+                if gap_cols[i] - gap_cols[i - 1] <= 3:  # 3px 이내면 연속
+                    current_group.append(gap_cols[i])
+                else:
+                    groups.append(current_group)
+                    current_group = [gap_cols[i]]
+            groups.append(current_group)
+
+            # 가장 긴 연속 구간의 중심
+            longest_group = max(groups, key=len)
+            gap_center = (longest_group[0] + longest_group[-1]) // 2
             ratio = gap_center / width
 
-            logger.info(f"갭 탐지: pos={gap_center}/{width}, ratio={ratio:.3f}")
+            logger.info(
+                f"갭 탐지 (밝기 이상치): pos={gap_center}/{width}, ratio={ratio:.3f}, "
+                f"anomaly={max_anomaly:.1f}, 구간길이={len(longest_group)}"
+            )
             return ratio
 
         except Exception as e:
