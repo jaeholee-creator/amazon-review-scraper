@@ -75,9 +75,16 @@ class TikTokShopScraper:
         profile_dir = os.path.join(self.data_dir, "browser_profile")
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
+        # headless 모드 결정: DISPLAY 환경변수가 있으면 headed(Xvfb) 사용
+        use_headless = self.headless
+        display = os.environ.get("DISPLAY", "")
+        if use_headless and display:
+            logger.info(f"DISPLAY={display} 감지 → Xvfb headed 모드로 전환")
+            use_headless = False
+
         self._context = await self._playwright.chromium.launch_persistent_context(
             profile_dir,
-            headless=self.headless,
+            headless=use_headless,
             viewport={"width": 1440, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -95,7 +102,47 @@ class TikTokShopScraper:
         )
         self._browser = None  # persistent context는 browser 객체 없음
 
-        # 스텔스: 자동화 흔적 제거
+        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+
+        # playwright-stealth 적용 (봇 탐지 우회)
+        try:
+            from playwright_stealth import stealth_async
+            await stealth_async(self._page)
+            logger.info("playwright-stealth 적용 완료")
+        except ImportError:
+            logger.warning("playwright-stealth 미설치 - 수동 스텔스 적용")
+            await self._apply_manual_stealth()
+
+        # 추가 CDP 흔적 제거 (stealth가 커버하지 못하는 영역)
+        await self._context.add_init_script("""
+            // CDP Runtime.enable 흔적 제거
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+            // permissions.query 오버라이드 (headless 탐지 방지)
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+
+            // WebGL vendor/renderer spoofing
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, parameter);
+            };
+        """)
+
+        # 로그인 시도
+        logged_in = await self._ensure_logged_in()
+        return logged_in
+
+    async def _apply_manual_stealth(self):
+        """playwright-stealth 미설치 시 수동 스텔스 적용 (폴백)"""
         await self._context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = {
@@ -113,13 +160,10 @@ class TikTokShopScraper:
             Object.defineProperty(navigator, 'languages', {
                 get: () => ['en-US', 'en']
             });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
         """)
-
-        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-
-        # 로그인 시도
-        logged_in = await self._ensure_logged_in()
-        return logged_in
 
     async def close(self):
         """브라우저 종료"""
@@ -146,7 +190,7 @@ class TikTokShopScraper:
     # =========================================================================
 
     async def _ensure_logged_in(self) -> bool:
-        """로그인 상태 확인 및 필요시 로그인 수행"""
+        """로그인 상태 확인 및 필요시 로그인 수행 (최대 2회 시도)"""
         page = self._page
 
         # Rating 페이지로 이동하여 세션 확인
@@ -158,7 +202,7 @@ class TikTokShopScraper:
         for _ in range(4):
             await page.wait_for_timeout(5000)
             if await self._is_logged_in():
-                logger.info("기존 세션으로 로그인 확인됨")
+                logger.info("기존 세션으로 로그인 확인됨 (캡차/로그인 건너뜀)")
                 await self._dismiss_popups()
                 return True
             current_url = page.url
@@ -166,7 +210,20 @@ class TikTokShopScraper:
                 break
 
         logger.info("세션 만료. 재로그인 진행...")
-        return await self._do_login()
+
+        # 최대 2회 로그인 시도
+        for attempt in range(1, 3):
+            logger.info(f"로그인 시도 {attempt}/2")
+            success = await self._do_login()
+            if success:
+                return True
+            if attempt < 2:
+                logger.info("로그인 실패 - 5초 후 재시도")
+                await page.wait_for_timeout(5000)
+
+        # 2회 모두 실패 시 Slack 알림
+        self._notify_captcha_failure()
+        return False
 
     async def _is_logged_in(self) -> bool:
         """현재 페이지에서 로그인 상태 확인 (URL + 페이지 콘텐츠 기반).
@@ -241,7 +298,6 @@ class TikTokShopScraper:
             await page.wait_for_timeout(3000)
 
             # "Log in" 탭으로 전환 (기본이 Sign up일 수 있음)
-            # 여러 셀렉터 시도
             for selector in [
                 'a[href*="/account/login"]',
                 'div:has-text("Log in") >> nth=0',
@@ -261,44 +317,39 @@ class TikTokShopScraper:
                 await email_tab.click()
                 await page.wait_for_timeout(1000)
 
-            # 이메일 입력
+            # 이메일 입력 (React controlled component 대응)
             email_input = await page.query_selector(
                 'input[name="email"], input[type="email"], input[placeholder*="email" i]'
             )
             if email_input:
-                await email_input.fill(self.email)
+                await self._react_safe_input(email_input, self.email)
                 logger.info(f"이메일 입력: {self.email}")
             else:
                 logger.error("이메일 입력 필드를 찾을 수 없음")
                 return False
 
-            # 비밀번호 입력
+            # 비밀번호 입력 (React controlled component 대응)
             password_input = await page.query_selector(
                 'input[name="password"], input[type="password"]'
             )
             if password_input:
-                await password_input.fill(self.password)
+                await self._react_safe_input(password_input, self.password)
                 logger.info("비밀번호 입력 완료")
             else:
                 logger.error("비밀번호 입력 필드를 찾을 수 없음")
                 return False
 
-            # 로그인 버튼 클릭 ("Continue" 버튼이 실제 제출 버튼)
-            # 주의: button:has-text("Log in")은 "Log in with Google" 등을 먼저 매칭할 수 있음
-            login_button = None
-            for btn_sel in [
-                'button:has-text("Continue")',
-                'button[type="submit"]',
-            ]:
-                login_button = await page.query_selector(btn_sel)
-                if login_button:
-                    logger.info(f"로그인 버튼 발견: {btn_sel}")
-                    break
+            # 입력값 검증 (React state 동기화 확인)
+            email_value = await email_input.evaluate("el => el.value")
+            password_value = await password_input.evaluate("el => el.value")
+            if email_value != self.email or password_value != self.password:
+                logger.warning(f"입력값 불일치 감지 - 재입력 시도 (email: '{email_value}' vs '{self.email}')")
+                await self._react_safe_input(email_input, self.email, force_events=True)
+                await self._react_safe_input(password_input, self.password, force_events=True)
 
-            if login_button:
-                await login_button.click()
-                logger.info("로그인 버튼 클릭")
-            else:
+            # 로그인 버튼 클릭 (다양한 방법 시도)
+            login_clicked = await self._click_login_button()
+            if not login_clicked:
                 logger.error("로그인 버튼을 찾을 수 없음")
                 return False
 
@@ -312,7 +363,8 @@ class TikTokShopScraper:
                 captcha_passed = await self._handle_captcha()
 
                 if not captcha_passed:
-                    if not self.headless:
+                    if not self.headless or os.environ.get("DISPLAY", ""):
+                        # headed 또는 Xvfb 모드: 수동 캡차 풀기 대기 (최대 60초)
                         logger.info("캡차를 수동으로 풀어주세요 (최대 60초 대기)")
                         for _ in range(12):
                             await page.wait_for_timeout(5000)
@@ -320,6 +372,7 @@ class TikTokShopScraper:
                                 break
                     else:
                         logger.error("Headless 모드에서 캡차 자동 풀기 실패")
+                        self._notify_captcha_failure()
                         return False
 
                 # 캡차 후 페이지 전환 대기
@@ -404,6 +457,74 @@ class TikTokShopScraper:
         except Exception as e:
             logger.error(f"로그인 오류: {e}")
             return False
+
+    async def _react_safe_input(self, element, text: str, force_events: bool = False):
+        """
+        React controlled component에 안전하게 텍스트 입력.
+        fill()이 React state를 업데이트하지 못하는 문제를 우회합니다.
+        """
+        page = self._page
+
+        # 요소 클릭으로 포커스 확보
+        await element.click()
+        await page.wait_for_timeout(200)
+
+        # 기존 값 클리어 (Ctrl+A → Delete)
+        await page.keyboard.press("Control+a")
+        await page.keyboard.press("Delete")
+        await page.wait_for_timeout(100)
+
+        if force_events:
+            # JS로 React 이벤트 시스템 직접 트리거
+            await element.evaluate("""
+                (el, text) => {
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    nativeInputValueSetter.call(el, text);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            """, text)
+        else:
+            # press_sequentially로 실제 키보드 이벤트 발생 (React가 인식)
+            await element.press_sequentially(text, delay=50)
+
+        await page.wait_for_timeout(300)
+
+    async def _click_login_button(self) -> bool:
+        """로그인 버튼 클릭 (다양한 방법 시도)"""
+        page = self._page
+
+        # 방법 1: 셀렉터로 직접 클릭
+        for selector in [
+            'button[type="submit"]',
+            'button:has-text("Log in")',
+            'button:has-text("Continue")',
+        ]:
+            btn = await page.query_selector(selector)
+            if btn and await btn.is_visible():
+                await btn.click()
+                logger.info(f"로그인 버튼 클릭: {selector}")
+                return True
+
+        # 방법 2: Enter 키
+        logger.info("로그인 버튼을 찾지 못함 - Enter 키로 시도")
+        await page.keyboard.press("Enter")
+        return True
+
+    def _notify_captcha_failure(self):
+        """캡차 실패 시 Slack 알림 전송"""
+        try:
+            from src.slack_notifier import SlackNotifier
+            notifier = SlackNotifier()
+            notifier.send_error_alert(
+                "TikTok Seller Center 캡차 풀기 실패!\n"
+                "headless 모드에서 캡차가 나타났습니다.\n"
+                "Xvfb headed 모드 또는 Euler Stream API 설정을 확인해주세요."
+            )
+        except Exception as e:
+            logger.warning(f"Slack 알림 전송 실패: {e}")
 
     async def _handle_captcha(self) -> bool:
         """캡차가 있으면 자동으로 풀기. 캡차가 남아있으면 False 반환."""

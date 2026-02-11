@@ -3,14 +3,21 @@ TikTok 슬라이더 퍼즐 캡차 자동 풀기.
 
 TikTok Seller Center 로그인 시 나타나는 원형 퍼즐 캡차를 자동으로 풀어줍니다.
 배경 이미지의 갭 위치를 탐지하고 슬라이더를 인간처럼 드래그합니다.
+
+갭 위치 탐지 전략 (우선순위):
+1. Euler Stream API (무료 25건/일, 99.2% 정확도) - EULER_STREAM_API_KEY 설정 시
+2. 로컬 에지 디텍션 (Pillow 기반) - 폴백
 """
 import asyncio
+import base64
 import io
 import logging
 import math
+import os
 import random
 from typing import Optional
 
+import aiohttp
 from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
@@ -154,6 +161,10 @@ class TikTokCaptchaSolver:
         """
         퍼즐 배경 이미지에서 갭 위치를 분석합니다.
 
+        전략:
+        1. Euler Stream API (EULER_STREAM_API_KEY 설정 시)
+        2. 로컬 에지 디텍션 (Pillow 기반, 폴백)
+
         Returns:
             갭 위치의 비율 (0.0~1.0) 또는 None (분석 실패)
         """
@@ -175,6 +186,16 @@ class TikTokCaptchaSolver:
             if not bg_src or not piece_src:
                 return None
 
+            # Euler Stream API 시도 (설정되어 있는 경우)
+            euler_api_key = os.environ.get("EULER_STREAM_API_KEY", "")
+            if euler_api_key:
+                euler_result = await self._solve_with_euler_stream(
+                    bg_src, piece_src, euler_api_key
+                )
+                if euler_result is not None:
+                    return euler_result
+                logger.info("Euler Stream API 실패 → 로컬 분석으로 폴백")
+
             bg_image = self._decode_data_uri(bg_src)
             piece_image = self._decode_data_uri(piece_src)
 
@@ -187,6 +208,79 @@ class TikTokCaptchaSolver:
 
         except Exception as e:
             logger.warning(f"퍼즐 이미지 분석 오류: {e}")
+            return None
+
+    async def _solve_with_euler_stream(
+        self, bg_src: str, piece_src: str, api_key: str
+    ) -> Optional[float]:
+        """
+        Euler Stream 무료 API로 캡차 풀기.
+        무료 플랜: 일 25건, 99.2% 정확도.
+
+        Returns:
+            갭 위치의 비율 (0.0~1.0) 또는 None (실패)
+        """
+        try:
+            # data URI에서 base64 부분만 추출
+            bg_b64 = bg_src.split(",", 1)[1] if "," in bg_src else bg_src
+            piece_b64 = piece_src.split(",", 1)[1] if "," in piece_src else piece_src
+
+            payload = {
+                "type": "slider",
+                "image": bg_b64,
+                "slider_image": piece_b64,
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                "apikey": api_key,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.euler.stream/v1/captcha/solve",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Euler Stream API 오류: HTTP {resp.status}")
+                        return None
+
+                    data = await resp.json()
+
+                    if not data.get("success"):
+                        logger.warning(f"Euler Stream API 실패: {data.get('message', 'unknown')}")
+                        return None
+
+                    # API 응답에서 x 좌표 비율 추출
+                    x_position = data.get("data", {}).get("x", None)
+                    slide_x = data.get("data", {}).get("slide_x", None)
+
+                    if x_position is not None:
+                        # x_position이 픽셀값인 경우 배경 이미지 폭 대비 비율로 변환
+                        bg_image = self._decode_data_uri(bg_src)
+                        if bg_image:
+                            ratio = x_position / bg_image.width
+                            logger.info(f"Euler Stream API 결과: x={x_position}, ratio={ratio:.3f}")
+                            return ratio
+                        return x_position  # 이미 비율일 수 있음
+
+                    if slide_x is not None:
+                        bg_image = self._decode_data_uri(bg_src)
+                        if bg_image:
+                            ratio = slide_x / bg_image.width
+                            logger.info(f"Euler Stream API 결과: slide_x={slide_x}, ratio={ratio:.3f}")
+                            return ratio
+
+                    logger.warning(f"Euler Stream API 응답 파싱 실패: {data}")
+                    return None
+
+        except asyncio.TimeoutError:
+            logger.warning("Euler Stream API 타임아웃 (15초)")
+            return None
+        except Exception as e:
+            logger.warning(f"Euler Stream API 호출 오류: {e}")
             return None
 
     @staticmethod

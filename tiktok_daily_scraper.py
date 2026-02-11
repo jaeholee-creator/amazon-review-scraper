@@ -6,6 +6,8 @@ TikTok Shop Daily Review Scraper
 import asyncio
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -35,6 +37,56 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+def ensure_xvfb() -> bool:
+    """
+    Xvfb 가상 디스플레이 설정 (headless 환경에서 headed 브라우저 실행용).
+    DISPLAY가 이미 설정되어 있으면 건너뛰고, 없으면 Xvfb를 시작합니다.
+
+    Returns:
+        True if DISPLAY is available (either existing or newly started)
+    """
+    # 이미 DISPLAY가 설정되어 있으면 (데스크탑 환경 또는 이미 Xvfb 실행중)
+    if os.environ.get("DISPLAY"):
+        logger.info(f"DISPLAY 이미 설정됨: {os.environ['DISPLAY']}")
+        return True
+
+    # Xvfb가 설치되어 있는지 확인
+    if not shutil.which("Xvfb"):
+        logger.info("Xvfb 미설치 - headless 모드로 실행")
+        return False
+
+    # Xvfb 시작 (디스플레이 :99)
+    display_num = ":99"
+    try:
+        # 기존 Xvfb 프로세스 확인
+        result = subprocess.run(
+            ["pgrep", "-f", f"Xvfb {display_num}"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            logger.info(f"Xvfb 이미 실행 중 (DISPLAY={display_num})")
+            os.environ["DISPLAY"] = display_num
+            return True
+
+        # Xvfb 시작
+        subprocess.Popen(
+            ["Xvfb", display_num, "-screen", "0", "1920x1080x24", "-ac"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = display_num
+        logger.info(f"Xvfb 시작 완료 (DISPLAY={display_num})")
+
+        # Xvfb 안정화 대기
+        import time
+        time.sleep(1)
+        return True
+
+    except Exception as e:
+        logger.warning(f"Xvfb 시작 실패: {e} - headless 모드로 실행")
+        return False
 
 
 async def scrape_tiktok_reviews() -> dict:
@@ -115,6 +167,13 @@ async def main():
     logger.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
+    # Xvfb 가상 디스플레이 설정 (headed 모드로 캡차 우회)
+    xvfb_available = ensure_xvfb()
+    if xvfb_available:
+        logger.info("Xvfb 사용 가능 → headed 모드로 실행 (캡차 우회)")
+    else:
+        logger.info("Xvfb 미사용 → headless + stealth 모드로 실행")
+
     start_date, end_date = get_tiktok_collection_date_range()
     date_str = f"{start_date} ~ {end_date}"
 
@@ -131,12 +190,16 @@ async def main():
     elapsed = time.time() - start_time
 
     # 3. 최종 요약
+    total_reviews = scrape_result.get("total_reviews", 0)
+    appended = publish_result.get("appended_reviews", 0)
+    status = scrape_result.get("status", "unknown")
+
     logger.info("\n" + "=" * 80)
     logger.info("최종 요약")
     logger.info("=" * 80)
-    logger.info(f"  수집: {scrape_result.get('total_reviews', 0)}개 리뷰")
-    logger.info(f"  업로드: {publish_result.get('appended_reviews', 0)}개 신규")
-    logger.info(f"  상태: {scrape_result.get('status', 'unknown')}")
+    logger.info(f"  수집: {total_reviews}개 리뷰")
+    logger.info(f"  업로드: {appended}개 신규")
+    logger.info(f"  상태: {status}")
     logger.info("=" * 80)
     logger.info("TikTok Shop Daily Review Scraper 완료")
     logger.info("=" * 80)
@@ -146,13 +209,10 @@ async def main():
         from src.slack_notifier import SlackNotifier
         slack = SlackNotifier()
 
-        total_reviews = scrape_result.get('total_reviews', 0)
-        status = scrape_result.get('status', 'failed')
         error_msg = scrape_result.get('error', '')
-        new_count = publish_result.get('appended_reviews', 0)
 
         slack_results = [{
-            'product_name': f'US (+{new_count} new)',
+            'product_name': f'US (+{appended} new)',
             'review_count': total_reviews,
             'status': status,
             'error_message': error_msg if status != 'success' else '',
