@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 class TikTokCaptchaSolver:
     """TikTok 슬라이더 퍼즐 캡차 자동 풀기"""
 
-    MAX_RETRIES = 5
+    MAX_RETRIES = 3  # rate limit 방지: 5 → 3
+    EULER_API_URL = "https://api.eulerstream.com/captchas/puzzle"
 
     # DOM 셀렉터
     CONTAINER_SEL = ".captcha-verify-container"
@@ -117,7 +118,7 @@ class TikTokCaptchaSolver:
         """단일 캡차 풀기 시도"""
         page = self.page
 
-        # 1. 슬라이더 버튼 찾기
+        # 1. 슬라이더 버튼 및 트랙 찾기
         slider_button = await page.query_selector(self.SLIDER_BUTTON_SEL)
         slider_track = await page.query_selector(self.SLIDER_TRACK_SEL)
 
@@ -134,7 +135,19 @@ class TikTokCaptchaSolver:
         button_width = button_box["width"]
         usable_width = track_width - button_width
 
-        # 2. 퍼즐 이미지 분석하여 타겟 위치 계산
+        # 2. 퍼즐 조각/배경 이미지 크기 측정 (디버깅 로그)
+        bg_img_el = await page.query_selector(self.BG_IMAGE_SEL)
+        piece_img_el = await page.query_selector(self.PIECE_IMAGE_SEL)
+        if bg_img_el and piece_img_el:
+            bg_box = await bg_img_el.bounding_box()
+            piece_box = await piece_img_el.bounding_box()
+            if bg_box and piece_box:
+                logger.info(
+                    f"퍼즐 렌더링 크기: bg={bg_box['width']:.0f}x{bg_box['height']:.0f}, "
+                    f"piece={piece_box['width']:.0f}x{piece_box['height']:.0f}"
+                )
+
+        # 3. 퍼즐 이미지 분석하여 타겟 위치 계산
         target_ratio = await self._analyze_puzzle_images()
 
         # 재시도 시 지터 오프셋 적용
@@ -148,12 +161,11 @@ class TikTokCaptchaSolver:
                 f"jitter={jitter:+.2f}, adjusted={adjusted_ratio:.2f}, drag={drag_distance}px"
             )
         else:
-            # 분석 실패 시 랜덤 오프셋
             target_ratio = random.uniform(0.2, 0.7)
             drag_distance = int(usable_width * target_ratio)
             logger.info(f"이미지 분석 실패, 랜덤 시도: ratio={target_ratio:.2f}, drag={drag_distance}px")
 
-        # 3. 인간처럼 드래그
+        # 4. 인간처럼 드래그
         await self._human_drag(slider_button, drag_distance)
         return True
 
@@ -161,17 +173,91 @@ class TikTokCaptchaSolver:
         """
         퍼즐 배경 이미지에서 갭 위치를 분석합니다.
 
-        전략:
-        1. Euler Stream API (EULER_STREAM_API_KEY 설정 시)
-        2. 로컬 에지 디텍션 (Pillow 기반, 폴백)
+        1차: EulerStream API (99.2% 정확도, 30-40ms)
+        2차 폴백: 로컬 이미지 분석 (에지 + 밝기 하이브리드)
 
         Returns:
             갭 위치의 비율 (0.0~1.0) 또는 None (분석 실패)
         """
+        # 1차: EulerStream API
+        api_key = os.environ.get("EULER_STREAM_API_KEY", "")
+        if api_key:
+            result = await self._solve_with_euler_api(api_key)
+            if result is not None:
+                return result
+            logger.warning("EulerStream API 실패 → 로컬 이미지 분석으로 폴백")
+
+        # 2차 폴백: 로컬 이미지 분석
+        return await self._local_image_analysis()
+
+    async def _solve_with_euler_api(self, api_key: str) -> Optional[float]:
+        """EulerStream API로 퍼즐 x좌표를 획득하여 ratio로 변환."""
+        try:
+            page = self.page
+            bg_img_el = await page.query_selector(self.BG_IMAGE_SEL)
+            if not bg_img_el:
+                logger.warning("EulerStream: 배경 이미지 요소를 찾을 수 없음")
+                return None
+
+            bg_src = await bg_img_el.get_attribute("src")
+            if not bg_src or not bg_src.startswith("data:image"):
+                logger.warning("EulerStream: 배경 이미지가 data URI가 아님")
+                return None
+
+            # data:image/webp;base64,... 에서 base64 데이터 추출
+            _header, b64_data = bg_src.split(",", 1)
+
+            # 이미지 너비 측정 (ratio 계산용)
+            image_bytes = base64.b64decode(b64_data)
+            bg_image = Image.open(io.BytesIO(image_bytes))
+            img_width = bg_image.width
+
+            # EulerStream API 호출
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.EULER_API_URL,
+                    headers={
+                        "x-api-key": api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={"puzzle": b64_data},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"EulerStream API 오류: {resp.status} - {body}")
+                        return None
+
+                    data = await resp.json()
+
+            if data.get("code") != 200:
+                logger.warning(f"EulerStream API 응답 코드 이상: {data}")
+                return None
+
+            x_pos = data.get("response", {}).get("x")
+            time_ms = data.get("response", {}).get("time_ms", 0)
+
+            if x_pos is None:
+                logger.warning(f"EulerStream API: x좌표 없음 - {data}")
+                return None
+
+            ratio = x_pos / img_width
+            ratio = max(0.05, min(0.95, ratio))
+            logger.info(
+                f"EulerStream API 성공: x={x_pos}, width={img_width}, "
+                f"ratio={ratio:.3f}, 응답={time_ms}ms"
+            )
+            return ratio
+
+        except Exception as e:
+            logger.warning(f"EulerStream API 호출 실패: {e}")
+            return None
+
+    async def _local_image_analysis(self) -> Optional[float]:
+        """로컬 이미지 분석으로 갭 위치 탐지 (EulerStream 폴백)."""
         try:
             page = self.page
 
-            # 배경 이미지와 퍼즐 조각 가져오기
             bg_img_el = await page.query_selector(self.BG_IMAGE_SEL)
             piece_img_el = await page.query_selector(self.PIECE_IMAGE_SEL)
 
@@ -179,108 +265,37 @@ class TikTokCaptchaSolver:
                 logger.warning("퍼즐 이미지 요소를 찾을 수 없음")
                 return None
 
-            # 이미지 데이터 추출 (base64 src에서)
             bg_src = await bg_img_el.get_attribute("src")
             piece_src = await piece_img_el.get_attribute("src")
 
             if not bg_src or not piece_src:
                 return None
 
-            # Euler Stream API 시도 (설정되어 있는 경우)
-            euler_api_key = os.environ.get("EULER_STREAM_API_KEY", "")
-            if euler_api_key:
-                euler_result = await self._solve_with_euler_stream(
-                    bg_src, piece_src, euler_api_key
-                )
-                if euler_result is not None:
-                    return euler_result
-                logger.info("Euler Stream API 실패 → 로컬 분석으로 폴백")
-
             bg_image = self._decode_data_uri(bg_src)
             piece_image = self._decode_data_uri(piece_src)
 
             if not bg_image or not piece_image:
-                # base64가 아닌 경우 스크린샷으로 대체
                 return await self._analyze_from_screenshot()
 
-            # 배경 이미지에서 갭 위치 탐지
-            return self._find_gap_position(bg_image, piece_image)
+            edge_ratio = self._find_gap_by_edge_energy(bg_image)
+            brightness_ratio = self._find_gap_position(bg_image, piece_image)
+
+            if edge_ratio is not None and brightness_ratio is not None:
+                if abs(edge_ratio - brightness_ratio) < 0.15:
+                    final = (edge_ratio + brightness_ratio) / 2
+                    logger.info(
+                        f"에지({edge_ratio:.3f}) + 밝기({brightness_ratio:.3f}) 합의 → {final:.3f}"
+                    )
+                    return final
+                logger.info(
+                    f"에지({edge_ratio:.3f}) vs 밝기({brightness_ratio:.3f}) 불일치 → 에지 우선"
+                )
+                return edge_ratio
+
+            return edge_ratio or brightness_ratio
 
         except Exception as e:
             logger.warning(f"퍼즐 이미지 분석 오류: {e}")
-            return None
-
-    async def _solve_with_euler_stream(
-        self, bg_src: str, piece_src: str, api_key: str
-    ) -> Optional[float]:
-        """
-        Euler Stream 무료 API로 캡차 풀기.
-        무료 플랜: 일 25건, 99.2% 정확도.
-
-        Returns:
-            갭 위치의 비율 (0.0~1.0) 또는 None (실패)
-        """
-        try:
-            # data URI에서 base64 부분만 추출
-            bg_b64 = bg_src.split(",", 1)[1] if "," in bg_src else bg_src
-            piece_b64 = piece_src.split(",", 1)[1] if "," in piece_src else piece_src
-
-            payload = {
-                "type": "slider",
-                "image": bg_b64,
-                "slider_image": piece_b64,
-            }
-
-            headers = {
-                "Content-Type": "application/json",
-                "apikey": api_key,
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.euler.stream/v1/captcha/solve",
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Euler Stream API 오류: HTTP {resp.status}")
-                        return None
-
-                    data = await resp.json()
-
-                    if not data.get("success"):
-                        logger.warning(f"Euler Stream API 실패: {data.get('message', 'unknown')}")
-                        return None
-
-                    # API 응답에서 x 좌표 비율 추출
-                    x_position = data.get("data", {}).get("x", None)
-                    slide_x = data.get("data", {}).get("slide_x", None)
-
-                    if x_position is not None:
-                        # x_position이 픽셀값인 경우 배경 이미지 폭 대비 비율로 변환
-                        bg_image = self._decode_data_uri(bg_src)
-                        if bg_image:
-                            ratio = x_position / bg_image.width
-                            logger.info(f"Euler Stream API 결과: x={x_position}, ratio={ratio:.3f}")
-                            return ratio
-                        return x_position  # 이미 비율일 수 있음
-
-                    if slide_x is not None:
-                        bg_image = self._decode_data_uri(bg_src)
-                        if bg_image:
-                            ratio = slide_x / bg_image.width
-                            logger.info(f"Euler Stream API 결과: slide_x={slide_x}, ratio={ratio:.3f}")
-                            return ratio
-
-                    logger.warning(f"Euler Stream API 응답 파싱 실패: {data}")
-                    return None
-
-        except asyncio.TimeoutError:
-            logger.warning("Euler Stream API 타임아웃 (15초)")
-            return None
-        except Exception as e:
-            logger.warning(f"Euler Stream API 호출 오류: {e}")
             return None
 
     @staticmethod
@@ -417,6 +432,138 @@ class TikTokCaptchaSolver:
 
         except Exception as e:
             logger.warning(f"갭 위치 분석 실패: {e}")
+            return None
+
+    @staticmethod
+    def _find_gap_by_edge_energy(bg_image: Image.Image) -> Optional[float]:
+        """
+        에지 검출 기반 갭 위치 탐지.
+
+        배경 이미지에 Laplacian 에지 필터를 적용한 후,
+        열별 에지 에너지(밀도)를 계산하여 갭 위치를 찾습니다.
+
+        갭은 원래 이미지의 텍스처가 없는 빈 공간이므로
+        주변보다 에지 에너지가 다릅니다 (경계는 높고, 내부는 낮음).
+        """
+        try:
+            bg_gray = bg_image.convert("L")
+            width, height = bg_gray.size
+            cx, cy = width // 2, height // 2
+            radius = min(width, height) // 2 - 2
+            inner_radius = radius * 0.75
+
+            # 에지 검출 (Laplacian → 더 강한 에지 감지)
+            edges = bg_gray.filter(ImageFilter.FIND_EDGES)
+
+            # 원형 마스크 내에서 열별 에지 에너지 계산
+            col_energy = []
+            for x in range(width):
+                energy_sum = 0
+                pixel_count = 0
+                for y in range(height):
+                    dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+                    if dist < inner_radius:
+                        energy_sum += edges.getpixel((x, y))
+                        pixel_count += 1
+                if pixel_count > 0:
+                    col_energy.append(energy_sum / pixel_count)
+                else:
+                    col_energy.append(0)
+
+            # 유효 범위: 가장자리 15% 제외 (원의 경계 효과 방지)
+            margin = int(width * 0.15)
+            valid_range = col_energy[margin:width - margin]
+            if not valid_range:
+                return None
+
+            # 이동 평균으로 스무딩 (노이즈 제거)
+            window = max(3, int(width * 0.04))
+            smoothed = []
+            for i in range(len(valid_range)):
+                start = max(0, i - window)
+                end = min(len(valid_range), i + window + 1)
+                smoothed.append(sum(valid_range[start:end]) / (end - start))
+
+            # 전체 평균과의 편차가 가장 큰 영역 = 갭 경계
+            avg_energy = sum(smoothed) / len(smoothed)
+
+            # 에지 에너지가 평균보다 높은 영역 찾기 (갭의 원형 경계)
+            # 또는 낮은 영역 (갭 내부)
+            # 두 가지 방법을 모두 시도하고 더 명확한 결과 사용
+
+            # 방법 A: 에지 에너지 급증 구간 (갭 경계의 원형 에지)
+            gradient = []
+            for i in range(1, len(smoothed)):
+                gradient.append(abs(smoothed[i] - smoothed[i - 1]))
+
+            # 그래디언트의 피크 찾기 (갭 좌/우 경계)
+            peak_threshold = max(gradient) * 0.4 if gradient else 0
+            peaks = []
+            for i, g in enumerate(gradient):
+                if g >= peak_threshold:
+                    peaks.append(margin + i)
+
+            if len(peaks) >= 2:
+                # 인접한 피크들을 그룹핑
+                groups = []
+                current_group = [peaks[0]]
+                for i in range(1, len(peaks)):
+                    if peaks[i] - peaks[i - 1] <= 5:
+                        current_group.append(peaks[i])
+                    else:
+                        groups.append(current_group)
+                        current_group = [peaks[i]]
+                groups.append(current_group)
+
+                # 가장 강한 두 그룹의 중심 = 갭의 좌우 경계
+                groups.sort(key=lambda g: sum(gradient[p - margin] for p in g if 0 <= p - margin < len(gradient)), reverse=True)
+                if len(groups) >= 2:
+                    left_edge = (groups[0][0] + groups[0][-1]) // 2
+                    right_edge = (groups[1][0] + groups[1][-1]) // 2
+                    if left_edge > right_edge:
+                        left_edge, right_edge = right_edge, left_edge
+                    gap_center = (left_edge + right_edge) // 2
+                    ratio = gap_center / width
+                    logger.info(
+                        f"갭 탐지 (에지 에너지): 좌={left_edge}, 우={right_edge}, "
+                        f"중심={gap_center}/{width}, ratio={ratio:.3f}"
+                    )
+                    return ratio
+
+            # 방법 B: 에지 에너지가 전체 평균보다 확연히 다른 영역
+            anomaly_threshold = avg_energy * 0.6
+            low_energy_cols = []
+            for i, e in enumerate(smoothed):
+                if e < anomaly_threshold:
+                    low_energy_cols.append(margin + i)
+
+            if low_energy_cols:
+                # 가장 큰 연속 구간
+                groups = []
+                current_group = [low_energy_cols[0]]
+                for i in range(1, len(low_energy_cols)):
+                    if low_energy_cols[i] - low_energy_cols[i - 1] <= 3:
+                        current_group.append(low_energy_cols[i])
+                    else:
+                        groups.append(current_group)
+                        current_group = [low_energy_cols[i]]
+                groups.append(current_group)
+
+                longest = max(groups, key=len)
+                if len(longest) >= 5:  # 최소 5px 이상
+                    gap_center = (longest[0] + longest[-1]) // 2
+                    ratio = gap_center / width
+                    logger.info(
+                        f"갭 탐지 (낮은 에지 에너지): 중심={gap_center}/{width}, "
+                        f"ratio={ratio:.3f}, 구간={len(longest)}px"
+                    )
+                    return ratio
+
+            logger.warning("에지 에너지 기반 갭 탐지 실패")
+            return None
+
+        except Exception as e:
+            logger.warning(f"에지 에너지 분석 실패: {e}")
             return None
 
     async def _analyze_from_screenshot(self) -> Optional[float]:
