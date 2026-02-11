@@ -166,6 +166,12 @@ const crawlShopReviews = async (page, spcCds, shop) => {
   let consecutiveDupPages = 0; // 연속 중복 페이지 카운터
   let fromPageNumber = 1;      // cursor가 생성된 페이지 번호
 
+  // 최근 3일 필터링
+  const threeDaysAgo = Math.floor(Date.now() / 1000) - (3 * 24 * 60 * 60); // Unix timestamp
+  const cutoffDate = new Date(threeDaysAgo * 1000).toISOString().split('T')[0];
+  console.log(`[${shop.name}] 수집 범위: 최근 3일 (${cutoffDate} 이후)`);
+  let shouldStop = false;
+
   // --- 첫 페이지 ---
   const firstPage = await fetchReviewsInBrowser(page, spcCds, shop, 1, '');
   if (firstPage.code !== 0) {
@@ -183,13 +189,24 @@ const crawlShopReviews = async (page, spcCds, shop) => {
   console.log(`[${shop.name}] page_info keys: [${pageInfoKeys.join(', ')}]`);
   console.log(`[${shop.name}] data keys (except list): [${dataKeys.join(', ')}]`);
 
-  // 첫 페이지 데이터 추가
+  // 첫 페이지 데이터 추가 (날짜 필터링)
   for (const item of firstPage.data.list) {
+    // 3일 이전 리뷰는 스킵 및 종료 플래그
+    if (item.submit_time < threeDaysAgo) {
+      console.warn(`[${shop.name}] 첫 페이지에서 3일 이전 리뷰 발견 → 해당 리뷰까지만 수집`);
+      shouldStop = true;
+      break;
+    }
     const id = String(item.comment_id);
     if (!seenIds.has(id)) {
       seenIds.add(id);
       allReviews.push(item);
     }
+  }
+
+  if (shouldStop) {
+    console.log(`[${shop.name}] 완료: 유니크 ${seenIds.size.toLocaleString()}건 (최근 3일)`);
+    return allReviews;
   }
 
   cursor = extractNextCursor(firstPage);
@@ -210,6 +227,12 @@ const crawlShopReviews = async (page, spcCds, shop) => {
           if (retryResult.code === 0) {
             const newIds = [];
             for (const item of retryResult.data.list) {
+              // 3일 이전 리뷰는 스킵 및 종료 플래그
+              if (item.submit_time < threeDaysAgo) {
+                console.warn(`[${shop.name}] p${pageNumber} 재시도: 3일 이전 리뷰 도달 → 크롤링 종료`);
+                shouldStop = true;
+                break;
+              }
               const id = String(item.comment_id);
               if (!seenIds.has(id)) {
                 seenIds.add(id);
@@ -224,12 +247,19 @@ const crawlShopReviews = async (page, spcCds, shop) => {
           }
         }
         if (!retrySuccess) console.error(`[${shop.name}] p${pageNumber} 재시도 실패, 스킵`);
+        if (shouldStop) break;
         continue;
       }
 
-      // 중복 감지: 이번 페이지에서 새로운 ID가 몇 개인지 확인
+      // 중복 감지 + 날짜 필터링
       let newCount = 0;
       for (const item of result.data.list) {
+        // 3일 이전 리뷰는 스킵 및 종료 플래그
+        if (item.submit_time < threeDaysAgo) {
+          console.warn(`[${shop.name}] p${pageNumber}: 3일 이전 리뷰 도달 → 크롤링 종료`);
+          shouldStop = true;
+          break;
+        }
         const id = String(item.comment_id);
         if (!seenIds.has(id)) {
           seenIds.add(id);
@@ -237,6 +267,8 @@ const crawlShopReviews = async (page, spcCds, shop) => {
           newCount++;
         }
       }
+
+      if (shouldStop) break;
 
       // 데이터가 없거나 전부 중복이면 카운터 증가
       if (result.data.list.length === 0 || newCount === 0) {
@@ -272,7 +304,7 @@ const crawlShopReviews = async (page, spcCds, shop) => {
     }
   }
 
-  console.log(`[${shop.name}] 완료: 유니크 ${seenIds.size.toLocaleString()}건 (API 보고 총: ${totalCount.toLocaleString()}건)`);
+  console.log(`[${shop.name}] 완료: 유니크 ${seenIds.size.toLocaleString()}건 (최근 3일, API 보고 총: ${totalCount.toLocaleString()}건)`);
   return allReviews;
 };
 
