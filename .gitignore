@@ -67,3 +67,9 @@ data/biodance/
 
 # 서비스 계정 키
 config/service-account.json
+
+# Node.js (shopee-seller-centre)
+node_modules/
+scrapers/shopee-seller-centre/auth-state.json
+scrapers/shopee-seller-centre/service-account.json
+scrapers/shopee-seller-centre/output/

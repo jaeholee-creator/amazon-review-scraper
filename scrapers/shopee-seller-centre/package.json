@@ -1,0 +1,15 @@
+{
+  "name": "shopee-review-crawler",
+  "version": "1.0.0",
+  "description": "Shopee Seller Centre 리뷰 데이터 크롤러 (SG, TW, PH)",
+  "main": "crawler.js",
+  "scripts": {
+    "crawl": "node crawler.js",
+    "test": "node test-api.js",
+    "upload": "node upload-to-sheets.js"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0",
+    "playwright": "^1.58.2"
+  }
+}
