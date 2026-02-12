@@ -1111,12 +1111,16 @@ class TikTokShopScraper:
 
                 # 캡차 감지
                 try:
-                    captcha = await page.query_selector('#captcha_container, .captcha_verify_container')
+                    captcha = await page.query_selector(
+                        '#captcha_container, .captcha_verify_container, '
+                        '.cap-rounded-full.cap-bg-UISheetGrouped3, '
+                        '[class*="captcha"], [id*="captcha"]'
+                    )
                     if captcha:
                         logger.info("  캡차 감지 → 자동 풀기 시도...")
                         # 캡차 풀기는 메인 로직의 captcha_solver 재활용
-                        from utils.captcha_solver import CaptchaSolver
-                        solver = CaptchaSolver(page)
+                        from utils.captcha_solver import TikTokCaptchaSolver
+                        solver = TikTokCaptchaSolver(page)
                         solved = await solver.solve()
                         if solved:
                             logger.info("  캡차 해결!")
