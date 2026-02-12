@@ -114,6 +114,9 @@ class TikTokShopScraper:
         # Patchright 사용 시 stealth 불필요 (CDP 프로토콜 레벨에서 자동 처리)
         logger.info("Patchright 브라우저 시작 완료 (anti-bot 자동 우회)")
 
+        # JSON 쿠키 파일에서 세션 복원 (수동 로그인으로 추출한 쿠키)
+        await self._load_cookies_from_file()
+
         # 로그인 시도
         logged_in = await self._ensure_logged_in()
         return logged_in
@@ -160,7 +163,60 @@ class TikTokShopScraper:
     # Cookie / Session Management
     # =========================================================================
     # 영구 브라우저 프로필 사용 → 쿠키/localStorage/sessionStorage 자동 유지
-    # 별도 쿠키 파일 저장 불필요
+    # 수동 로그인으로 추출한 JSON 쿠키 파일을 프로필에 주입 가능
+
+    async def _load_cookies_from_file(self):
+        """JSON 쿠키 파일에서 세션 쿠키를 로드하여 브라우저 컨텍스트에 주입.
+
+        수동 로그인으로 추출한 쿠키를 EC2 프로필에 복원하는 용도.
+        이미 유효한 세션 쿠키가 있으면 스킵.
+        """
+        import json
+
+        cookie_file = os.path.join(self.data_dir, "tiktok_cookies.json")
+        if not os.path.exists(cookie_file):
+            return
+
+        # 이미 세션 쿠키가 있으면 파일 로드 스킵
+        existing = await self._context.cookies()
+        has_session = any(c["name"] in ("sid_tt", "sessionid",
+                                        "sid_tt_tiktokseller", "sessionid_tiktokseller")
+                         for c in existing)
+        if has_session:
+            logger.info("기존 세션 쿠키 존재 → JSON 쿠키 로드 스킵")
+            return
+
+        try:
+            with open(cookie_file, "r") as f:
+                cookies = json.load(f)
+
+            if not cookies:
+                return
+
+            # Playwright add_cookies 형식으로 변환
+            valid_cookies = []
+            for c in cookies:
+                cookie = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c["domain"],
+                    "path": c.get("path", "/"),
+                }
+                if c.get("expires", -1) > 0:
+                    cookie["expires"] = c["expires"]
+                if c.get("httpOnly"):
+                    cookie["httpOnly"] = True
+                if c.get("secure"):
+                    cookie["secure"] = True
+                if c.get("sameSite"):
+                    cookie["sameSite"] = c["sameSite"]
+                valid_cookies.append(cookie)
+
+            await self._context.add_cookies(valid_cookies)
+            logger.info(f"JSON 쿠키 파일에서 {len(valid_cookies)}개 쿠키 로드 완료")
+
+        except Exception as e:
+            logger.warning(f"JSON 쿠키 로드 실패 (무시): {e}")
 
     # =========================================================================
     # Login
@@ -172,7 +228,9 @@ class TikTokShopScraper:
         session_info = {}
 
         for cookie in cookies:
-            if cookie["name"] in ("sid_tt", "sessionid", "sessionid_ss", "sid_guard"):
+            if cookie["name"] in ("sid_tt", "sessionid", "sessionid_ss", "sid_guard",
+                                    "sid_tt_tiktokseller", "sessionid_tiktokseller",
+                                    "sessionid_ss_tiktokseller", "sid_guard_tiktokseller"):
                 expires = cookie.get("expires", 0)
                 if expires > 0:
                     expire_dt = datetime.fromtimestamp(expires)
@@ -186,21 +244,25 @@ class TikTokShopScraper:
         return session_info
 
     def _notify_session_expiring(self, session_info: dict):
-        """세션 만료 7일 전 Slack 알림"""
-        for name, info in session_info.items():
-            if not info.get("healthy", True):
-                try:
-                    from src.slack_notifier import SlackNotifier
-                    notifier = SlackNotifier()
-                    notifier.send_error_alert(
-                        f"TikTok 세션 만료 임박!\n"
-                        f"쿠키 '{name}' 만료까지 {info['remaining_days']}일 남음\n"
-                        f"만료일: {info['expires']}\n"
-                        f"EC2에서 수동 로그인 필요: python manual_tiktok_login.py"
-                    )
-                    logger.warning(f"세션 만료 임박 Slack 알림 전송: {name} ({info['remaining_days']}일 남음)")
-                except Exception as e:
-                    logger.warning(f"세션 만료 Slack 알림 실패: {e}")
+        """세션 만료 7일 전 Slack 알림 (1회 통합 발송)"""
+        expiring = {name: info for name, info in session_info.items()
+                    if not info.get("healthy", True)}
+        if not expiring:
+            return
+
+        min_days = min(info["remaining_days"] for info in expiring.values())
+        details = "\n".join(f"  - {name}: {info['remaining_days']}일 남음 ({info['expires']})"
+                           for name, info in expiring.items())
+        try:
+            from src.slack_notifier import SlackNotifier
+            notifier = SlackNotifier()
+            notifier.send_error_alert(
+                f"TikTok 세션 만료 임박! ({min_days}일 남음)\n{details}\n"
+                f"로컬에서 수동 로그인 후 쿠키를 EC2에 업로드 필요"
+            )
+            logger.warning(f"세션 만료 임박 Slack 알림 전송: {len(expiring)}개 쿠키, 최소 {min_days}일 남음")
+        except Exception as e:
+            logger.warning(f"세션 만료 Slack 알림 실패: {e}")
 
     async def _ensure_logged_in(self) -> bool:
         """세션 쿠키 우선 확인 → 유효하면 로그인 건너뜀 → 만료 시 자동 로그인 시도"""
@@ -208,14 +270,14 @@ class TikTokShopScraper:
 
         # 1단계: 세션 쿠키 존재 여부 빠른 체크
         cookies = await self._context.cookies()
-        has_session = any(c["name"] in ("sid_tt", "sessionid") for c in cookies)
+        has_session = any(c["name"] in ("sid_tt", "sessionid",
+                                        "sid_tt_tiktokseller", "sessionid_tiktokseller") for c in cookies)
 
         if has_session:
             # 세션 만료 모니터링
             session_info = await self._check_session_health()
-            for name, info in session_info.items():
-                if not info.get("healthy", True):
-                    self._notify_session_expiring(session_info)
+            if any(not info.get("healthy", True) for info in session_info.values()):
+                self._notify_session_expiring(session_info)
 
         # 2단계: Rating 페이지로 이동하여 세션 실제 유효성 확인
         logger.info("Seller Center 접속 시도...")
@@ -526,36 +588,55 @@ class TikTokShopScraper:
     async def _react_safe_input(self, element, text: str, force_events: bool = False):
         """
         React controlled component에 안전하게 텍스트 입력.
-        fill()이 React state를 업데이트하지 못하는 문제를 우회합니다.
+        SSO iframe 내부의 React input도 지원 (fill → type → JS 순서).
         """
         page = self._page
 
-        # 요소 클릭으로 포커스 확보
-        await element.click()
-        await page.wait_for_timeout(200)
+        # 방법 1: fill() (CDP 레벨에서 작동, iframe 호환성 최고)
+        try:
+            await element.fill(text)
+            await page.wait_for_timeout(200)
+            value = await element.evaluate("el => el.value")
+            if value == text:
+                return
+            logger.debug(f"fill() 후 값 불일치: '{value}' vs '{text}'")
+        except Exception as e:
+            logger.debug(f"fill() 실패: {e}")
 
-        # 기존 값 클리어 (Ctrl+A → Delete)
-        await page.keyboard.press("Control+a")
-        await page.keyboard.press("Delete")
-        await page.wait_for_timeout(100)
+        # 방법 2: click + type() (키보드 이벤트)
+        try:
+            await element.click()
+            await page.wait_for_timeout(200)
+            await page.keyboard.press("Control+a")
+            await page.keyboard.press("Delete")
+            await page.wait_for_timeout(100)
+            await element.type(text, delay=50)
+            await page.wait_for_timeout(200)
+            value = await element.evaluate("el => el.value")
+            if value == text:
+                return
+            logger.debug(f"type() 후 값 불일치: '{value}' vs '{text}'")
+        except Exception as e:
+            logger.debug(f"type() 실패: {e}")
 
-        if force_events:
-            # JS로 React 이벤트 시스템 직접 트리거
+        # 방법 3: JS로 React 이벤트 시스템 직접 트리거 (최종 폴백)
+        try:
             await element.evaluate("""
                 (el, text) => {
+                    el.focus();
                     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value'
                     ).set;
                     nativeInputValueSetter.call(el, text);
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
                 }
             """, text)
-        else:
-            # ElementHandle.type()로 실제 키보드 이벤트 발생 (React가 인식)
-            await element.type(text, delay=50)
-
-        await page.wait_for_timeout(300)
+            await page.wait_for_timeout(300)
+        except Exception as e:
+            logger.warning(f"JS 강제 입력도 실패: {e}")
 
     async def _click_login_button(self) -> bool:
         """로그인 버튼 클릭 (다양한 방법 시도)"""
@@ -745,11 +826,15 @@ class TikTokShopScraper:
             # 로그인 성공 확인: 세션 쿠키 체크
             await page.wait_for_timeout(3000)
             cookies = await self._context.cookies()
+            SESSION_COOKIE_NAMES = ("sid_tt", "sessionid", "sessionid_ss", "sid_guard",
+                                    "sid_tt_tiktokseller", "sessionid_tiktokseller",
+                                    "sessionid_ss_tiktokseller", "sid_guard_tiktokseller")
             session_cookies = {c["name"]: c["value"] for c in cookies
-                             if c["name"] in ("sid_tt", "sessionid", "sessionid_ss", "sid_guard")}
+                             if c["name"] in SESSION_COOKIE_NAMES}
             logger.info(f"세션 쿠키 확인: {list(session_cookies.keys())}")
 
-            has_session = bool(session_cookies.get("sessionid") or session_cookies.get("sid_tt"))
+            has_session = bool(session_cookies.get("sessionid") or session_cookies.get("sid_tt")
+                             or session_cookies.get("sessionid_tiktokseller") or session_cookies.get("sid_tt_tiktokseller"))
 
             if not has_session:
                 # 추가 대기 (로그인 처리 중일 수 있음)
@@ -757,8 +842,9 @@ class TikTokShopScraper:
                     await page.wait_for_timeout(5000)
                     cookies = await self._context.cookies()
                     session_cookies = {c["name"]: c["value"] for c in cookies
-                                     if c["name"] in ("sid_tt", "sessionid", "sessionid_ss", "sid_guard")}
-                    has_session = bool(session_cookies.get("sessionid") or session_cookies.get("sid_tt"))
+                                     if c["name"] in SESSION_COOKIE_NAMES}
+                    has_session = bool(session_cookies.get("sessionid") or session_cookies.get("sid_tt")
+                                     or session_cookies.get("sessionid_tiktokseller") or session_cookies.get("sid_tt_tiktokseller"))
                     if has_session:
                         break
                     current_url = page.url
