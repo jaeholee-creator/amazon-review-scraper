@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -19,6 +20,7 @@ const CONFIG = {
   slack: {
     botToken: process.env.SLACK_BOT_TOKEN || '',
     channelId: process.env.SLACK_CHANNEL_ID || '',
+    otpChannelId: process.env.SLACK_OTP_CHANNEL_ID || 'C03TLAR6VU6',
   },
   shops: [
     { region: 'sg', shopId: 951591050, name: 'Singapore' },
@@ -119,7 +121,7 @@ const getOtpFromSlack = async (afterTimestamp = null) => {
   for (let i = 0; i < maxRetries; i++) {
     try {
       const resp = await fetch(
-        `https://slack.com/api/conversations.history?channel=${CONFIG.slack.channelId}&limit=3`,
+        `https://slack.com/api/conversations.history?channel=${CONFIG.slack.otpChannelId}&limit=3`,
         { headers: { Authorization: `Bearer ${CONFIG.slack.botToken}` } }
       );
       const data = await resp.json();
@@ -160,7 +162,7 @@ const login = async (page) => {
   let latestTs = null;
   try {
     const resp = await fetch(
-      `https://slack.com/api/conversations.history?channel=${CONFIG.slack.channelId}&limit=1`,
+      `https://slack.com/api/conversations.history?channel=${CONFIG.slack.otpChannelId}&limit=1`,
       { headers: { Authorization: `Bearer ${CONFIG.slack.botToken}` } }
     );
     const data = await resp.json();
