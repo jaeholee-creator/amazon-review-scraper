@@ -147,7 +147,7 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
     except Exception as e:
         print(f"\nFailed to initialize session: {e}")
         await session.close()
-        return
+        sys.exit(1)  # non-zero exit code → Airflow가 재시도
 
     # Step 3: 각 제품 HTML 크롤링
     print("\n[Step 3] Scraping reviews (HTML crawling)...")
