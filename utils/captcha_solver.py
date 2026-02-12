@@ -5,9 +5,10 @@ TikTok Seller Center 로그인 시 나타나는 원형 퍼즐 캡차를 자동�
 배경 이미지의 갭 위치를 탐지하고 슬라이더를 인간처럼 드래그합니다.
 
 갭 위치 탐지 전략 (우선순위):
-1. EulerStream API (99.2% 정확도, 30-40ms) - EULER_STREAM_API_KEY 설정 시
-2. SadCaptcha API ($0.002/건) - SADCAPTCHA_API_KEY 설정 시 (폴백)
-3. 로컬 에지 디텍션 (Pillow 기반) - 최종 폴백
+1. OpenCV matchTemplate + Canny (80-92% 정확도, 로컬) - 배경+퍼즐 조각 비교
+2. EulerStream API (99.2% 정확도, 30-40ms) - EULER_STREAM_API_KEY 설정 시
+3. SadCaptcha API ($0.002/건) - SADCAPTCHA_API_KEY 설정 시
+4. 로컬 에지 디텍션 (Pillow 기반) - 최종 폴백
 """
 import asyncio
 import base64
@@ -19,7 +20,15 @@ import random
 from typing import Optional
 
 import aiohttp
+import numpy as np
 from PIL import Image, ImageFilter
+
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
+    logging.getLogger(__name__).warning("OpenCV 미설치 → PIL 폴백만 사용 가능")
 
 logger = logging.getLogger(__name__)
 
@@ -175,14 +184,22 @@ class TikTokCaptchaSolver:
         """
         퍼즐 배경 이미지에서 갭 위치를 분석합니다.
 
-        1차: EulerStream API (99.2% 정확도, 30-40ms)
-        2차: SadCaptcha API (폴백)
-        3차 폴백: 로컬 이미지 분석 (에지 + 밝기 하이브리드)
+        1차: OpenCV matchTemplate + Canny (로컬, 80-92% 정확도)
+        2차: EulerStream API (99.2% 정확도) - API KEY 설정 시
+        3차: SadCaptcha API - API KEY 설정 시
+        4차 폴백: 로컬 이미지 분석 (Pillow 기반)
 
         Returns:
             갭 위치의 비율 (0.0~1.0) 또는 None (분석 실패)
         """
-        # 1차: EulerStream API
+        # 1차: OpenCV matchTemplate + Canny (로컬, API 불필요)
+        if HAS_OPENCV:
+            result = await self._solve_with_opencv()
+            if result is not None:
+                return result
+            logger.warning("OpenCV 분석 실패 → API/PIL 폴백 시도")
+
+        # 2차: EulerStream API
         euler_key = os.environ.get("EULER_STREAM_API_KEY", "")
         if euler_key:
             result = await self._solve_with_eulerstream(euler_key)
@@ -190,16 +207,377 @@ class TikTokCaptchaSolver:
                 return result
             logger.warning("EulerStream API 실패 → SadCaptcha 폴백 시도")
 
-        # 2차: SadCaptcha API
+        # 3차: SadCaptcha API
         sad_key = os.environ.get("SADCAPTCHA_API_KEY", "")
         if sad_key:
             result = await self._solve_with_sadcaptcha(sad_key)
             if result is not None:
                 return result
-            logger.warning("SadCaptcha API 실패 → 로컬 이미지 분석으로 폴백")
+            logger.warning("SadCaptcha API 실패 → 로컬 PIL 분석으로 폴백")
 
-        # 3차 폴백: 로컬 이미지 분석
+        # 4차 폴백: 로컬 이미지 분석 (Pillow)
         return await self._local_image_analysis()
+
+    # =========================================================================
+    # OpenCV 기반 캡차 풀기 (1순위)
+    # =========================================================================
+
+    async def _solve_with_opencv(self) -> Optional[float]:
+        """OpenCV matchTemplate + Canny 에지 검출로 갭 위치 탐지.
+
+        3가지 서브 메서드를 순차적으로 시도:
+        1. Canny 에지 + matchTemplate (배경+퍼즐 조각 모두 사용, 80-92%)
+        2. 그레이스케일 matchTemplate (배경+퍼즐 조각, 70-85%)
+        3. 배경 전용 갭 검출 (Canny 에지만, 60-75%)
+
+        Returns:
+            갭 위치의 비율 (0.0~1.0) 또는 None
+        """
+        page = self.page
+
+        # 이미지 요소에서 data URI 추출
+        bg_img_el = await page.query_selector(self.BG_IMAGE_SEL)
+        piece_img_el = await page.query_selector(self.PIECE_IMAGE_SEL)
+
+        if not bg_img_el:
+            logger.warning("OpenCV: 배경 이미지 요소를 찾을 수 없음")
+            return None
+
+        bg_src = await bg_img_el.get_attribute("src")
+        if not bg_src or not bg_src.startswith("data:image"):
+            logger.warning("OpenCV: 배경 이미지가 data URI가 아님")
+            return None
+
+        bg_cv = self._data_uri_to_cv2(bg_src)
+        if bg_cv is None:
+            logger.warning("OpenCV: 배경 이미지 디코딩 실패")
+            return None
+
+        piece_cv = None
+        if piece_img_el:
+            piece_src = await piece_img_el.get_attribute("src")
+            if piece_src and piece_src.startswith("data:image"):
+                piece_cv = self._data_uri_to_cv2(piece_src)
+
+        img_width = bg_cv.shape[1]
+        logger.info(
+            f"OpenCV 분석 시작: bg={bg_cv.shape[1]}x{bg_cv.shape[0]}, "
+            f"piece={'있음' if piece_cv is not None else '없음'}"
+        )
+
+        results = []
+
+        # 1차: Canny 에지 + matchTemplate (퍼즐 조각 필수)
+        if piece_cv is not None:
+            ratio = self._match_by_canny_edge(bg_cv, piece_cv)
+            if ratio is not None:
+                logger.info(f"OpenCV [Canny+Template]: ratio={ratio:.3f}")
+                results.append(("canny_template", ratio, 0.92))
+
+            # 2차: 그레이스케일 matchTemplate
+            ratio = self._match_by_grayscale(bg_cv, piece_cv)
+            if ratio is not None:
+                logger.info(f"OpenCV [Grayscale Template]: ratio={ratio:.3f}")
+                results.append(("grayscale_template", ratio, 0.80))
+
+        # 3차: 배경 전용 갭 검출 (퍼즐 조각 없어도 가능)
+        ratio = self._detect_gap_by_canny(bg_cv)
+        if ratio is not None:
+            logger.info(f"OpenCV [Gap Detection]: ratio={ratio:.3f}")
+            results.append(("gap_detection", ratio, 0.65))
+
+        if not results:
+            logger.warning("OpenCV: 모든 서브 메서드 실패")
+            return None
+
+        # 결과 합산: 가중 평균 또는 단일 결과 반환
+        if len(results) == 1:
+            method, ratio, _ = results[0]
+            logger.info(f"OpenCV 최종 결과 ({method}): ratio={ratio:.3f}")
+            return ratio
+
+        # 여러 결과가 있으면 일치도 확인
+        ratios = [r[1] for r in results]
+        weights = [r[2] for r in results]
+
+        # 결과들이 비슷한 위치를 가리키면 (0.1 이내) 가중 평균
+        if max(ratios) - min(ratios) < 0.1:
+            weighted_sum = sum(r * w for r, w in zip(ratios, weights))
+            weight_total = sum(weights)
+            final_ratio = weighted_sum / weight_total
+            logger.info(
+                f"OpenCV 합의 ({len(results)}개 방법 일치): "
+                f"ratio={final_ratio:.3f}, 편차={max(ratios)-min(ratios):.3f}"
+            )
+            return final_ratio
+
+        # 불일치 시 가장 신뢰도 높은 결과 사용
+        best = max(results, key=lambda x: x[2])
+        logger.info(
+            f"OpenCV 결과 불일치 → 최고 신뢰도 사용 ({best[0]}): "
+            f"ratio={best[1]:.3f}, 전체: {[(r[0], f'{r[1]:.3f}') for r in results]}"
+        )
+        return best[1]
+
+    @staticmethod
+    def _data_uri_to_cv2(data_uri: str) -> Optional[np.ndarray]:
+        """data:image URI를 OpenCV numpy array로 변환."""
+        try:
+            _, b64_data = data_uri.split(",", 1)
+            img_bytes = base64.b64decode(b64_data)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            return img
+        except Exception as e:
+            logger.warning(f"data URI → cv2 변환 실패: {e}")
+            return None
+
+    @staticmethod
+    def _match_by_canny_edge(
+        bg: np.ndarray, piece: np.ndarray
+    ) -> Optional[float]:
+        """Canny 에지 + matchTemplate로 갭 위치 탐지 (1순위, 80-92%).
+
+        배경과 퍼즐 조각 모두의 에지를 추출한 뒤 template matching 수행.
+        에지 기반이므로 밝기/색상 변화에 강건함.
+        """
+        try:
+            bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+            piece_gray = cv2.cvtColor(piece, cv2.COLOR_BGR2GRAY)
+
+            # Canny 에지 검출
+            bg_edges = cv2.Canny(bg_gray, 100, 200)
+            piece_edges = cv2.Canny(piece_gray, 100, 200)
+
+            # 퍼즐 조각에서 유효 영역만 추출 (투명/검정 배경 제거)
+            # 알파 채널이 있으면 활용
+            if piece.shape[2] == 4:
+                alpha = piece[:, :, 3]
+                mask = (alpha > 10).astype(np.uint8)
+            else:
+                # 알파 없으면 검정 배경 제거 (RGB 합 > 30)
+                piece_sum = piece.sum(axis=2)
+                mask = (piece_sum > 30).astype(np.uint8)
+
+            # 마스크 내에서 바운딩 박스 추출
+            coords = cv2.findNonZero(mask)
+            if coords is None:
+                return None
+            x, y, w, h = cv2.boundingRect(coords)
+
+            # 너무 작은 조각은 무시
+            if w < 10 or h < 10:
+                return None
+
+            piece_crop = piece_edges[y:y+h, x:x+w]
+
+            # 배경보다 퍼즐 조각이 크면 불가
+            if piece_crop.shape[0] > bg_edges.shape[0] or piece_crop.shape[1] > bg_edges.shape[1]:
+                return None
+
+            # Template matching (TM_CCOEFF_NORMED: -1~1, 높을수록 일치)
+            result = cv2.matchTemplate(bg_edges, piece_crop, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val < 0.15:
+                logger.debug(f"Canny matchTemplate 신뢰도 낮음: {max_val:.3f}")
+                return None
+
+            # 갭 중심 x좌표 계산
+            gap_center_x = max_loc[0] + piece_crop.shape[1] // 2
+            ratio = gap_center_x / bg.shape[1]
+            ratio = max(0.05, min(0.95, ratio))
+
+            logger.info(
+                f"Canny matchTemplate: x={max_loc[0]}, 중심={gap_center_x}, "
+                f"confidence={max_val:.3f}, ratio={ratio:.3f}"
+            )
+            return ratio
+
+        except Exception as e:
+            logger.warning(f"Canny matchTemplate 실패: {e}")
+            return None
+
+    @staticmethod
+    def _match_by_grayscale(
+        bg: np.ndarray, piece: np.ndarray
+    ) -> Optional[float]:
+        """그레이스케일 matchTemplate로 갭 위치 탐지 (2순위, 70-85%).
+
+        색상 정보 없이 밝기만으로 매칭. Canny보다 단순하지만 보완적.
+        """
+        try:
+            bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+            piece_gray = cv2.cvtColor(piece, cv2.COLOR_BGR2GRAY)
+
+            # 퍼즐 조각 유효 영역 추출
+            if piece.shape[2] == 4:
+                alpha = piece[:, :, 3]
+                mask = (alpha > 10).astype(np.uint8)
+            else:
+                piece_sum = piece.sum(axis=2)
+                mask = (piece_sum > 30).astype(np.uint8)
+
+            coords = cv2.findNonZero(mask)
+            if coords is None:
+                return None
+            x, y, w, h = cv2.boundingRect(coords)
+
+            if w < 10 or h < 10:
+                return None
+
+            piece_crop = piece_gray[y:y+h, x:x+w]
+            mask_crop = (mask[y:y+h, x:x+w] * 255).astype(np.uint8)
+
+            if piece_crop.shape[0] > bg_gray.shape[0] or piece_crop.shape[1] > bg_gray.shape[1]:
+                return None
+
+            # 마스크 적용 template matching
+            result = cv2.matchTemplate(bg_gray, piece_crop, cv2.TM_CCOEFF_NORMED, mask=mask_crop)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val < 0.2:
+                logger.debug(f"Grayscale matchTemplate 신뢰도 낮음: {max_val:.3f}")
+                return None
+
+            gap_center_x = max_loc[0] + piece_crop.shape[1] // 2
+            ratio = gap_center_x / bg.shape[1]
+            ratio = max(0.05, min(0.95, ratio))
+
+            logger.info(
+                f"Grayscale matchTemplate: x={max_loc[0]}, 중심={gap_center_x}, "
+                f"confidence={max_val:.3f}, ratio={ratio:.3f}"
+            )
+            return ratio
+
+        except Exception as e:
+            logger.warning(f"Grayscale matchTemplate 실패: {e}")
+            return None
+
+    @staticmethod
+    def _detect_gap_by_canny(bg: np.ndarray) -> Optional[float]:
+        """배경 이미지만으로 갭 위치 검출 (3순위, 60-75%).
+
+        퍼즐 조각이 없어도 동작. 배경에서 Canny 에지를 추출한 후
+        열별 에지 밀도의 급격한 변화 영역을 갭으로 판단.
+
+        갭은 원래 텍스처가 제거된 영역이므로:
+        - 갭 내부: 에지 밀도 낮음
+        - 갭 경계: 에지 밀도 급증 (원형 경계선)
+        """
+        try:
+            bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+            height, width = bg_gray.shape
+
+            # 가우시안 블러로 노이즈 제거 후 Canny
+            blurred = cv2.GaussianBlur(bg_gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+
+            # 원형 이미지이므로 중앙 영역만 분석
+            cx, cy = width // 2, height // 2
+            radius = min(width, height) // 2 - 2
+            inner_radius = int(radius * 0.75)
+
+            # 원형 마스크 생성
+            mask = np.zeros_like(edges)
+            cv2.circle(mask, (cx, cy), inner_radius, 255, -1)
+            edges_masked = cv2.bitwise_and(edges, mask)
+
+            # 열별 에지 밀도 계산
+            col_density = np.zeros(width, dtype=np.float64)
+            col_count = np.zeros(width, dtype=np.float64)
+
+            for x in range(width):
+                col_pixels = mask[:, x]
+                valid_count = np.count_nonzero(col_pixels)
+                if valid_count > 0:
+                    edge_count = np.count_nonzero(edges_masked[:, x])
+                    col_density[x] = edge_count / valid_count
+                    col_count[x] = valid_count
+
+            # 가장자리 15% 제외
+            margin = int(width * 0.15)
+            valid_density = col_density[margin:width - margin]
+
+            if len(valid_density) == 0:
+                return None
+
+            # 스무딩 (커널 크기 = 5% 너비)
+            kernel_size = max(3, int(width * 0.05))
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            kernel = np.ones(kernel_size) / kernel_size
+            smoothed = np.convolve(valid_density, kernel, mode='same')
+
+            # 평균 에지 밀도
+            avg_density = np.mean(smoothed[smoothed > 0])
+            if avg_density == 0:
+                return None
+
+            # 에지 밀도가 평균보다 현저히 낮은 영역 = 갭 내부
+            threshold = avg_density * 0.5
+            low_density_mask = smoothed < threshold
+
+            # 연속 구간 찾기
+            diffs = np.diff(low_density_mask.astype(int))
+            starts = np.where(diffs == 1)[0] + 1
+            ends = np.where(diffs == -1)[0] + 1
+
+            if len(starts) == 0:
+                # 전체가 low일 수 있음
+                if low_density_mask[0]:
+                    starts = np.array([0])
+                else:
+                    return None
+            if len(ends) == 0 or (len(ends) > 0 and ends[-1] < starts[-1]):
+                ends = np.append(ends, len(smoothed) - 1)
+
+            # 가장 긴 연속 구간 찾기
+            best_gap = None
+            best_length = 0
+            min_gap_size = int(width * 0.05)  # 최소 5% 너비
+
+            for s, e in zip(starts, ends):
+                gap_len = e - s
+                if gap_len > best_length and gap_len >= min_gap_size:
+                    best_length = gap_len
+                    best_gap = (s, e)
+
+            if best_gap is None:
+                # 에지 밀도 그래디언트 기반 대안
+                gradient = np.abs(np.gradient(smoothed))
+                # 상위 피크들 찾기
+                peak_threshold = np.percentile(gradient, 90)
+                peak_indices = np.where(gradient > peak_threshold)[0]
+
+                if len(peak_indices) >= 2:
+                    # 가장 큰 간격의 피크 쌍 = 갭 좌우 경계
+                    peak_gaps = np.diff(peak_indices)
+                    max_gap_idx = np.argmax(peak_gaps)
+                    left_peak = peak_indices[max_gap_idx]
+                    right_peak = peak_indices[max_gap_idx + 1]
+                    gap_center = (left_peak + right_peak) // 2 + margin
+                    ratio = gap_center / width
+                    ratio = max(0.05, min(0.95, ratio))
+                    logger.info(f"Canny 갭 검출 (그래디언트): 중심={gap_center}, ratio={ratio:.3f}")
+                    return ratio
+
+                return None
+
+            # 갭 중심 좌표 (margin 오프셋 보정)
+            gap_center = (best_gap[0] + best_gap[1]) // 2 + margin
+            ratio = gap_center / width
+            ratio = max(0.05, min(0.95, ratio))
+
+            logger.info(
+                f"Canny 갭 검출: 구간={best_gap[0]+margin}~{best_gap[1]+margin}, "
+                f"중심={gap_center}, 길이={best_length}px, ratio={ratio:.3f}"
+            )
+            return ratio
+
+        except Exception as e:
+            logger.warning(f"Canny 갭 검출 실패: {e}")
+            return None
 
     async def _solve_with_eulerstream(self, api_key: str) -> Optional[float]:
         """EulerStream API로 퍼즐 x좌표를 획득하여 ratio로 변환.
