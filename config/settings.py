@@ -239,14 +239,21 @@ SHOPEE_SPREADSHEET_ID = '1NVUVShv5tAveINA9DdB2D21z71L3tF0In5JVK6LYX9s'
 
 def get_shopee_collection_date_range():
     """
-    Shopee 리뷰 수집 날짜 범위: today() ~ today()-3
+    Shopee 리뷰 수집 날짜 범위: KST 기준 today()-3 00:00 ~ today() 23:59:59
 
-    Returns: (start_date, end_date) as datetime objects
+    EC2 서버는 UTC이므로 KST→UTC 변환하여 반환.
+    Returns: (start_date, end_date) as timezone-naive UTC datetime objects
     """
-    from datetime import date
-    now = datetime.now()
-    end_date = now
-    start_date = now - timedelta(days=COLLECTION_WINDOW_DAYS)
+    from datetime import timezone
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.now(kst)
+    today_kst = now_kst.date()
+    # KST 기준 날짜 범위
+    start_kst = datetime(today_kst.year, today_kst.month, today_kst.day, 0, 0, 0) - timedelta(days=COLLECTION_WINDOW_DAYS)
+    end_kst = datetime(today_kst.year, today_kst.month, today_kst.day, 23, 59, 59)
+    # KST → UTC 변환 (timezone-naive로 반환)
+    start_date = start_kst - timedelta(hours=9)
+    end_date = end_kst - timedelta(hours=9)
     return start_date, end_date
 
 

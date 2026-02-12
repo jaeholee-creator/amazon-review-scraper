@@ -670,9 +670,9 @@ class TikTokShopScraper:
             if error_msg:
                 logger.error(f"www.tiktok.com 로그인 에러: {error_msg}")
                 await page.screenshot(path=f"{self.data_dir}/debug_tiktok_com_error.png", full_page=True)
-                # Rate limit 시 TikTok 쿠키 정리 (다음 실행에서 깨끗한 상태로 시작)
+                # Rate limit 시 쿠키 보존 (삭제하면 다음 실행에서 세션 재사용 불가 → 악순환)
                 if "Rate limit" in error_msg:
-                    await self._clear_tiktok_cookies()
+                    logger.warning("Rate limit 감지 - 쿠키 보존 (다음 실행에서 세션 재사용 시도)")
                 return False
 
             # 캡차 처리 (www.tiktok.com에서도 슬라이더 캡차 가능)
