@@ -304,9 +304,9 @@ class TikTokShopScraper:
 
         logger.info("세션 만료. 자동 로그인 진행...")
 
-        # 최대 2회 로그인 시도
+        # 최대 2회 직접 로그인 시도
         for attempt in range(1, 3):
-            logger.info(f"로그인 시도 {attempt}/2")
+            logger.info(f"직접 로그인 시도 {attempt}/2")
             success = await self._do_login()
             if success:
                 return True
@@ -314,7 +314,21 @@ class TikTokShopScraper:
                 logger.info("로그인 실패 - 5초 후 재시도")
                 await page.wait_for_timeout(5000)
 
-        # 2회 모두 실패 시 Slack 알림
+        # 4단계: 직접 로그인 실패 → 프록시 로그인 시도
+        logger.info("직접 로그인 실패 → 무료 프록시로 로그인 시도...")
+        proxy_success = await self._login_with_proxy()
+        if proxy_success:
+            # 프록시에서 얻은 쿠키를 메인 컨텍스트에 로드
+            await self._load_cookies_from_file()
+            # Seller Center 재접속
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
+            if await self._is_logged_in():
+                logger.info("프록시 로그인 세션으로 Seller Center 접근 성공!")
+                await self._dismiss_popups()
+                return True
+
+        # 모두 실패 시 Slack 알림
         self._notify_captcha_failure()
         return False
 
@@ -894,6 +908,228 @@ class TikTokShopScraper:
 
         except Exception as e:
             logger.error(f"www.tiktok.com 로그인 오류: {e}")
+            return False
+
+    # =========================================================================
+    # Proxy Login (IP 차단/Rate Limit 우회)
+    # =========================================================================
+
+    async def _login_with_proxy(self) -> bool:
+        """무료 프록시를 사용하여 별도 브라우저에서 로그인 후 쿠키 추출.
+
+        메인 브라우저와 별개로 프록시 브라우저를 생성하여 로그인만 수행.
+        성공 시 쿠키를 JSON 파일로 저장하고, 메인 브라우저에서 로드.
+        """
+        import json
+
+        try:
+            from utils.free_proxy import get_working_proxies
+        except ImportError:
+            logger.error("free_proxy 모듈 임포트 실패")
+            return False
+
+        proxies = await get_working_proxies(count=10)
+        if not proxies:
+            logger.error("사용 가능한 프록시 없음")
+            return False
+
+        for i, proxy_info in enumerate(proxies, 1):
+            proxy_str = proxy_info["proxy"]
+            protocol = proxy_info.get("protocol", "http")
+            proxy_url = f"{protocol}://{proxy_str}"
+            logger.info(f"프록시 로그인 시도 {i}/{len(proxies)}: {proxy_str} (IP: {proxy_info.get('ip', '?')})")
+
+            proxy_browser = None
+            try:
+                # 프록시 브라우저 생성 (임시, persistent 아님)
+                use_headless = True
+                display = os.environ.get("DISPLAY", "")
+                if display:
+                    use_headless = False
+
+                proxy_browser = await self._playwright.chromium.launch(
+                    headless=use_headless,
+                    proxy={"server": proxy_url},
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--disable-site-isolation-trials",
+                        "--disable-web-security",
+                    ],
+                )
+                context = await proxy_browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    bypass_csp=True,
+                )
+                page = await context.new_page()
+
+                # Seller Center 접속 → 로그인 페이지로 리다이렉트 예상
+                logger.info(f"  프록시로 Seller Center 접속 중...")
+                await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
+
+                current_url = page.url
+                if "/account/login" not in current_url and "/account/register" not in current_url:
+                    # 이미 로그인되어 있거나 다른 페이지
+                    if "homepage" in current_url or "product" in current_url:
+                        logger.info(f"  프록시 브라우저 이미 인증됨 (비정상)")
+
+                # SSO 로그인 시도
+                login_success = await self._proxy_do_login(page, context)
+
+                if login_success:
+                    # 쿠키 추출 및 저장
+                    cookies = await context.cookies()
+                    tiktok_cookies = [c for c in cookies if "tiktok" in c.get("domain", "")]
+
+                    SESSION_NAMES = ("sid_tt_tiktokseller", "sessionid_tiktokseller",
+                                    "sid_tt", "sessionid")
+                    has_session = any(c["name"] in SESSION_NAMES for c in tiktok_cookies)
+
+                    if has_session:
+                        cookie_file = os.path.join(self.data_dir, "tiktok_cookies.json")
+                        with open(cookie_file, "w") as f:
+                            json.dump(tiktok_cookies, f, indent=2)
+                        logger.info(f"프록시 로그인 성공! {len(tiktok_cookies)}개 쿠키 저장")
+                        await proxy_browser.close()
+                        return True
+                    else:
+                        logger.warning(f"  프록시 로그인 후 세션 쿠키 없음")
+
+                await proxy_browser.close()
+
+            except Exception as e:
+                logger.warning(f"  프록시 {proxy_str} 실패: {e}")
+                if proxy_browser:
+                    try:
+                        await proxy_browser.close()
+                    except Exception:
+                        pass
+
+        logger.error(f"모든 프록시 로그인 실패 ({len(proxies)}개 시도)")
+        return False
+
+    async def _proxy_do_login(self, page, context) -> bool:
+        """프록시 브라우저에서 Seller Center 로그인 수행."""
+        try:
+            current_url = page.url
+
+            # 로그인 페이지로 이동
+            if "/account/login" not in current_url:
+                await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
+
+            # Log in 탭 클릭 시도
+            try:
+                login_tabs = await page.query_selector_all('div:has-text("Log in")')
+                for tab in login_tabs[:1]:
+                    if await tab.is_visible():
+                        await tab.click()
+                        await page.wait_for_timeout(2000)
+                        break
+            except Exception:
+                pass
+
+            # 이메일 입력
+            email_selectors = [
+                'input[name="email"]', 'input[type="email"]',
+                'input[placeholder*="email" i]', 'input[name="username"]',
+            ]
+            email_input = None
+            for sel in email_selectors:
+                email_input = await page.query_selector(sel)
+                if email_input:
+                    break
+
+            if not email_input:
+                # iframe 내부 검색
+                for frame in page.frames:
+                    for sel in email_selectors:
+                        email_input = await frame.query_selector(sel)
+                        if email_input:
+                            page = frame  # iframe으로 전환
+                            break
+                    if email_input:
+                        break
+
+            if not email_input:
+                logger.warning("  이메일 입력 필드를 찾을 수 없음")
+                return False
+
+            await email_input.fill(self.email)
+            await page.wait_for_timeout(500)
+            logger.info(f"  이메일 입력 완료")
+
+            # 비밀번호 입력
+            pw_input = await page.query_selector('input[type="password"]')
+            if not pw_input:
+                logger.warning("  비밀번호 입력 필드를 찾을 수 없음")
+                return False
+
+            await pw_input.fill(self.password)
+            await page.wait_for_timeout(500)
+            logger.info(f"  비밀번호 입력 완료")
+
+            # 로그인 버튼 클릭
+            login_btn = await page.query_selector(
+                'button:has-text("Log in"), button:has-text("로그인"), button[type="submit"]'
+            )
+            if login_btn:
+                await login_btn.click()
+                logger.info("  로그인 버튼 클릭")
+            else:
+                logger.warning("  로그인 버튼을 찾을 수 없음")
+                return False
+
+            # 로그인 결과 대기 (최대 60초)
+            for wait in range(12):
+                await page.wait_for_timeout(5000)
+                try:
+                    url = page.url if hasattr(page, 'url') else ""
+                except Exception:
+                    url = ""
+
+                # 성공 패턴
+                if any(p in url for p in ("homepage", "product/rating", "compass")):
+                    logger.info(f"  프록시 로그인 성공! URL: {url[:80]}")
+                    return True
+
+                # 실패 패턴 - rate limit
+                try:
+                    body = await page.evaluate("() => document.body.innerText.substring(0, 500)")
+                    if "Rate limit" in body or "Maximum number" in body:
+                        logger.warning(f"  프록시 IP도 Rate limit 감지")
+                        return False
+                    if "사용자가 존재하지 않음" in body or "user does not exist" in body.lower():
+                        logger.warning(f"  사용자 존재하지 않음 에러")
+                        return False
+                except Exception:
+                    pass
+
+                # 캡차 감지
+                try:
+                    captcha = await page.query_selector('#captcha_container, .captcha_verify_container')
+                    if captcha:
+                        logger.info("  캡차 감지 → 자동 풀기 시도...")
+                        # 캡차 풀기는 메인 로직의 captcha_solver 재활용
+                        from utils.captcha_solver import CaptchaSolver
+                        solver = CaptchaSolver(page)
+                        solved = await solver.solve()
+                        if solved:
+                            logger.info("  캡차 해결!")
+                            await page.wait_for_timeout(3000)
+                            continue
+                except Exception:
+                    pass
+
+            logger.warning("  프록시 로그인 타임아웃")
+            return False
+
+        except Exception as e:
+            logger.error(f"  프록시 로그인 오류: {e}")
             return False
 
     async def _clear_tiktok_cookies(self):
