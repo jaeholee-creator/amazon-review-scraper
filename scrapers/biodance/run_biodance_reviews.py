@@ -44,27 +44,8 @@ def main():
     logger.info("Biodance 리뷰 증분 수집을 시작합니다...")
     results, new_count = crawler.collect_incremental(json_path)
 
-    # JSON 저장 (선택적, 로컬 백업용)
-    save_local = os.getenv("SAVE_LOCAL_FILES", "true").lower() == "true"
-    if save_local:
-        crawler.save_to_json(results, json_path)
-
-        # 제품별 JSON 저장
-        for product in results["products"]:
-            handle = product["handle"]
-            product_json_path = os.path.join(DATA_DIR, f"biodance_reviews_{handle}.json")
-            crawler.save_to_json(product, product_json_path)
-
-        # CSV 저장 (전체 통합)
-        all_reviews: list[dict] = []
-        for product in results["products"]:
-            all_reviews.extend(product["reviews"])
-
-        csv_path = os.path.join(DATA_DIR, "biodance_reviews_all.csv")
-        crawler.save_to_csv(all_reviews, csv_path)
-        logger.info("로컬 파일 저장 완료: JSON, CSV")
-    else:
-        logger.info("로컬 파일 저장 생략 (SAVE_LOCAL_FILES=false)")
+    # 로컬 파일 저장 제거 - Google Sheets만 사용
+    logger.info("로컬 파일 저장 생략 (Google Sheets가 Single Source of Truth)")
 
     # Google Sheets 발행 (신규)
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
@@ -118,10 +99,6 @@ def main():
         )
 
     logger.info("-" * 60)
-    if save_local:
-        logger.info("JSON: %s", json_path)
-        logger.info("CSV:  %s", csv_path)
-
     elapsed = time.time() - start_time
 
     # Slack 알림

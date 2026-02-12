@@ -26,8 +26,87 @@ const CONFIG = {
     { region: 'ph', shopId: 952094055, name: 'Philippines' },
   ],
   pageSize: 20,
-  outputDir: path.join(__dirname, 'output'),
   requestDelay: 300,
+};
+
+// ============================================================
+// Slack Notification
+// ============================================================
+const sendSlackNotification = async (shopResults, totalUploaded, totalDuplicates, elapsedMinutes) => {
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  const channelId = process.env.SLACK_CHANNEL_ID;
+
+  if (!botToken || !channelId) {
+    console.log('[Slack] 토큰/채널 미설정 - 알림 생략');
+    return false;
+  }
+
+  const totalCrawled = Object.values(shopResults).reduce((sum, count) => sum + count, 0);
+  const status = totalUploaded > 0 ? '✅' : '⚠️';
+
+  const blocks = [
+    {
+      type: 'header',
+      text: {
+        type: 'plain_text',
+        text: `${status} Shopee Scraper Report`,
+        emoji: true,
+      },
+    },
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*채널:*\nShopee SG/TW/PH` },
+        { type: 'mrkdwn', text: `*날짜:*\n최근 3일` },
+        { type: 'mrkdwn', text: `*크롤링:*\n${totalCrawled.toLocaleString()}건` },
+        { type: 'mrkdwn', text: `*업로드:*\n${totalUploaded.toLocaleString()}건` },
+      ],
+    },
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*소요 시간:*\n${elapsedMinutes}분` },
+        { type: 'mrkdwn', text: `*중복 스킵:*\n${totalDuplicates.toLocaleString()}건` },
+      ],
+    },
+    { type: 'divider' },
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: CONFIG.shops.map((s) => {
+          const count = shopResults[s.name] || 0;
+          return `• ${s.name}: ${count.toLocaleString()}건`;
+        }).join('\n'),
+      },
+    },
+  ];
+
+  try {
+    const resp = await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${botToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        channel: channelId,
+        text: `Shopee Report: ${totalCrawled.toLocaleString()}건 크롤링, ${totalUploaded.toLocaleString()}건 업로드`,
+        blocks,
+      }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      console.log('[Slack] 알림 전송 완료');
+      return true;
+    } else {
+      console.error(`[Slack] 전송 실패: ${data.error}`);
+      return false;
+    }
+  } catch (err) {
+    console.error(`[Slack] 전송 오류: ${err.message}`);
+    return false;
+  }
 };
 
 // ============================================================
@@ -292,11 +371,9 @@ const crawlShopReviews = async (page, spcCds, shop) => {
         console.log(`[${shop.name}] p${pageNumber}/${totalPages} (${pct}%) | 유니크: ${seenIds.size.toLocaleString()} | 이번 페이지 신규: ${newCount}`);
       }
 
-      // 중간 저장 (500 페이지마다)
+      // 중간 진행 상황 출력 (500 페이지마다)
       if (pageNumber % 500 === 0) {
-        const tempPath = path.join(CONFIG.outputDir, `reviews_${shop.region}_temp.json`);
-        fs.writeFileSync(tempPath, JSON.stringify(allReviews), 'utf-8');
-        console.log(`[${shop.name}] 중간 저장 (${allReviews.length.toLocaleString()}건)`);
+        console.log(`[${shop.name}] 진행 중: ${allReviews.length.toLocaleString()}건 수집 완료`);
       }
     } catch (err) {
       console.error(`[${shop.name}] p${pageNumber} 예외: ${err.message}`);
@@ -309,34 +386,8 @@ const crawlShopReviews = async (page, spcCds, shop) => {
 };
 
 // ============================================================
-// Save helpers
+// Google Sheets 업로드 전용 (로컬 파일 저장 제거)
 // ============================================================
-const escapeCSV = (val) => {
-  if (val === null || val === undefined) return '';
-  const str = String(val).replace(/"/g, '""');
-  return str.includes(',') || str.includes('"') || str.includes('\n') ? `"${str}"` : str;
-};
-
-const saveToCSV = (reviews, shop) => {
-  const headers = [
-    'country', 'comment_id', 'order_sn', 'user_name', 'user_id',
-    'rating_star', 'comment', 'product_name', 'product_id', 'model_name',
-    'images', 'reply_comment', 'reply_time', 'submit_time', 'submit_date',
-    'status', 'low_rating_reasons',
-  ];
-  const rows = reviews.map((r) => {
-    const submitDate = r.submit_time ? new Date(r.submit_time * 1000).toISOString().split('T')[0] : '';
-    return [
-      shop.name, r.comment_id, r.order_sn, r.user_name, r.user_id,
-      r.rating_star, r.comment || '', r.product_name || '', r.product_id,
-      r.model_name || '', (r.images || []).join('|'),
-      r.reply?.comment || '',
-      r.reply?.ctime ? new Date(r.reply.ctime * 1000).toISOString() : '',
-      r.submit_time, submitDate, r.status, (r.low_rating_reasons || []).join('|'),
-    ].map(escapeCSV).join(',');
-  });
-  return [headers.join(','), ...rows].join('\n');
-};
 
 const formatReviews = (reviews, shop) => reviews.map((r) => ({
   country: shop.name,
@@ -366,8 +417,6 @@ const main = async () => {
   console.log('Shopee Review Crawler 시작');
   console.log(`대상: ${CONFIG.shops.map((s) => s.name).join(', ')}`);
   console.log('출력: Google Sheets 직접 업로드\n');
-
-  if (!fs.existsSync(CONFIG.outputDir)) fs.mkdirSync(CONFIG.outputDir, { recursive: true });
 
   // 저장된 auth state 사용
   const hasAuthState = fs.existsSync(CONFIG.authStatePath);
@@ -431,10 +480,6 @@ const main = async () => {
       } catch (sheetsErr) {
         console.error(`[Sheets] ${shop.name} 업로드 실패: ${sheetsErr.message}`);
       }
-
-      // temp 파일 정리
-      const tempPath = path.join(CONFIG.outputDir, `reviews_${shop.region}_temp.json`);
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
     }
 
     // 4. 새 세션 저장 (다음 실행용)
@@ -451,6 +496,9 @@ const main = async () => {
     console.log(`  ${'Sheets 업로드'.padEnd(14)} ${totalUploaded.toLocaleString()}건 (중복 ${totalDuplicates.toLocaleString()}건 스킵)`);
     console.log(`  소요: ${elapsed}분`);
     console.log('='.repeat(60));
+
+    // 6. Slack 알림
+    await sendSlackNotification(shopResults, totalUploaded, totalDuplicates, elapsed);
   } catch (err) {
     console.error('크롤링 오류:', err.message);
   } finally {

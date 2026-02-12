@@ -136,12 +136,15 @@ class BiodanceReviewCrawler:
         product_id: str,
         product_name: str,
         known_review_ids: set[str] | None = None,
+        cutoff_date: str | None = None,
     ) -> tuple[list[BiodanceReview], dict]:
         """특정 제품의 리뷰를 페이지네이션으로 수집
 
         Args:
             known_review_ids: 이미 수집된 review_id 집합.
                 제공 시, 해당 ID는 건너뛰고 한 페이지 전체가 기존 리뷰면 조기 종료.
+            cutoff_date: 날짜 필터링 기준 (YYYY-MM-DD 형식).
+                제공 시, 이 날짜 이전 리뷰 발견 시 조기 종료.
 
         Returns:
             (새 리뷰 리스트, 메타 정보 dict)
@@ -187,15 +190,33 @@ class BiodanceReviewCrawler:
                     total_pages,
                 )
 
-            # 리뷰 파싱 + 중복 체크
+            # 리뷰 파싱 + 중복 체크 + 날짜 필터링
             page_new_count = 0
+            should_stop = False
             for item in payload.get("list", []):
                 rid = str(item.get("id", ""))
+
+                # 중복 체크
                 if rid in known_review_ids:
                     continue
+
+                # 날짜 필터링
+                if cutoff_date:
+                    review_date = item.get("commented_at", "")
+                    if review_date:
+                        review_date_str = str(review_date).split(" ")[0]
+                        if review_date_str < cutoff_date:
+                            logger.info("    page %d: %s 이전 리뷰 도달 → 조기 종료", page, cutoff_date)
+                            should_stop = True
+                            break
+
                 review = self._parse_review_item(item, product_name, product_id)
                 new_reviews.append(review)
                 page_new_count += 1
+
+            # 날짜 기준 조기 종료
+            if should_stop:
+                break
 
             # 이 페이지에서 신규 리뷰가 0개면 → 이후 페이지도 전부 기존 리뷰이므로 조기 종료
             if known_review_ids and page_new_count == 0:
@@ -243,6 +264,12 @@ class BiodanceReviewCrawler:
         Returns:
             (병합된 전체 결과 dict, 이번에 추가된 신규 리뷰 수)
         """
+        # 최근 3일 날짜 필터링 설정
+        from datetime import datetime, timedelta
+        cutoff_date = datetime.now() - timedelta(days=3)
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d')
+        logger.info("날짜 필터: %s 이후 리뷰만 수집", cutoff_str)
+
         existing = self.load_existing_data(existing_data_path)
 
         # 기존 데이터에서 제품별 리뷰 맵 구축: product_id → {review_id_set, reviews_list}
@@ -282,7 +309,7 @@ class BiodanceReviewCrawler:
             known_ids = existing_map.get(product_id, {}).get("review_ids", set())
 
             logger.info("[%d/%d] %s 수집 중... (기존 %d개)", i, len(products), product_name, len(known_ids))
-            new_reviews, meta = self.fetch_product_reviews(product_id, product_name, known_ids)
+            new_reviews, meta = self.fetch_product_reviews(product_id, product_name, known_ids, cutoff_str)
 
             # 기존 리뷰 + 신규 리뷰 병합
             if product_id in existing_map:
