@@ -12,7 +12,10 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, Page, BrowserContext
+try:
+    from patchright.async_api import async_playwright, Page, BrowserContext
+except ImportError:
+    from playwright.async_api import async_playwright, Page, BrowserContext
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +89,9 @@ class TikTokShopScraper:
             profile_dir,
             headless=use_headless,
             viewport={"width": 1440, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/133.0.0.0 Safari/537.36"
-            ),
             locale="en-US",
             timezone_id="America/New_York",
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 # SSO iframe 크로스 오리진 지원
@@ -102,45 +99,14 @@ class TikTokShopScraper:
                 "--disable-site-isolation-trials",
                 "--disable-web-security",
             ],
-            ignore_default_args=["--enable-automation"],
             bypass_csp=True,
         )
         self._browser = None  # persistent context는 browser 객체 없음
 
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
-        # playwright-stealth 적용 (봇 탐지 우회)
-        try:
-            from playwright_stealth import stealth_async
-            await stealth_async(self._page)
-            logger.info("playwright-stealth 적용 완료")
-        except ImportError:
-            logger.warning("playwright-stealth 미설치 - 수동 스텔스 적용")
-            await self._apply_manual_stealth()
-
-        # 추가 CDP 흔적 제거 (stealth가 커버하지 못하는 영역)
-        await self._context.add_init_script("""
-            // CDP Runtime.enable 흔적 제거
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-            // permissions.query 오버라이드 (headless 탐지 방지)
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-            );
-
-            // WebGL vendor/renderer spoofing
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return getParameter.call(this, parameter);
-            };
-        """)
+        # Patchright 사용 시 stealth 불필요 (CDP 프로토콜 레벨에서 자동 처리)
+        logger.info("Patchright 브라우저 시작 완료 (anti-bot 자동 우회)")
 
         # 로그인 시도
         logged_in = await self._ensure_logged_in()
@@ -194,11 +160,58 @@ class TikTokShopScraper:
     # Login
     # =========================================================================
 
+    async def _check_session_health(self) -> dict:
+        """세션 쿠키 유효성 및 남은 수명 확인"""
+        cookies = await self._context.cookies()
+        session_info = {}
+
+        for cookie in cookies:
+            if cookie["name"] in ("sid_tt", "sessionid", "sessionid_ss", "sid_guard"):
+                expires = cookie.get("expires", 0)
+                if expires > 0:
+                    expire_dt = datetime.fromtimestamp(expires)
+                    remaining = (expire_dt - datetime.now()).days
+                    session_info[cookie["name"]] = {
+                        "expires": expire_dt.isoformat(),
+                        "remaining_days": remaining,
+                        "healthy": remaining > 7,
+                    }
+
+        return session_info
+
+    def _notify_session_expiring(self, session_info: dict):
+        """세션 만료 7일 전 Slack 알림"""
+        for name, info in session_info.items():
+            if not info.get("healthy", True):
+                try:
+                    from src.slack_notifier import SlackNotifier
+                    notifier = SlackNotifier()
+                    notifier.send_error_alert(
+                        f"TikTok 세션 만료 임박!\n"
+                        f"쿠키 '{name}' 만료까지 {info['remaining_days']}일 남음\n"
+                        f"만료일: {info['expires']}\n"
+                        f"EC2에서 수동 로그인 필요: python manual_tiktok_login.py"
+                    )
+                    logger.warning(f"세션 만료 임박 Slack 알림 전송: {name} ({info['remaining_days']}일 남음)")
+                except Exception as e:
+                    logger.warning(f"세션 만료 Slack 알림 실패: {e}")
+
     async def _ensure_logged_in(self) -> bool:
-        """로그인 상태 확인 및 필요시 로그인 수행 (최대 2회 시도)"""
+        """세션 쿠키 우선 확인 → 유효하면 로그인 건너뜀 → 만료 시 자동 로그인 시도"""
         page = self._page
 
-        # Rating 페이지로 이동하여 세션 확인
+        # 1단계: 세션 쿠키 존재 여부 빠른 체크
+        cookies = await self._context.cookies()
+        has_session = any(c["name"] in ("sid_tt", "sessionid") for c in cookies)
+
+        if has_session:
+            # 세션 만료 모니터링
+            session_info = await self._check_session_health()
+            for name, info in session_info.items():
+                if not info.get("healthy", True):
+                    self._notify_session_expiring(session_info)
+
+        # 2단계: Rating 페이지로 이동하여 세션 실제 유효성 확인
         logger.info("Seller Center 접속 시도...")
         await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
 
@@ -214,7 +227,14 @@ class TikTokShopScraper:
             if "/account/login" in current_url or "/account/register" in current_url:
                 break
 
-        logger.info("세션 만료. 재로그인 진행...")
+        # 3단계: 세션 만료 — 자동 로그인 허용 여부 확인
+        auto_login = os.environ.get("TIKTOK_AUTO_LOGIN", "true").lower() == "true"
+        if not auto_login:
+            logger.error("세션 만료 - 수동 로그인 필요 (TIKTOK_AUTO_LOGIN=false)")
+            self._notify_captcha_failure()
+            return False
+
+        logger.info("세션 만료. 자동 로그인 진행...")
 
         # 최대 2회 로그인 시도
         for attempt in range(1, 3):
