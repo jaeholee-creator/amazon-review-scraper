@@ -290,6 +290,7 @@ class TikTokShopScraper:
             if await self._is_logged_in():
                 logger.info("기존 세션으로 로그인 확인됨 (캡차/로그인 건너뜀)")
                 await self._dismiss_popups()
+                await self._save_cookies_to_file()
                 return True
             current_url = page.url
             if "/account/login" in current_url or "/account/register" in current_url:
@@ -309,6 +310,7 @@ class TikTokShopScraper:
             logger.info(f"직접 로그인 시도 {attempt}/2")
             success = await self._do_login()
             if success:
+                await self._save_cookies_to_file()
                 return True
             if attempt < 2:
                 logger.info("로그인 실패 - 5초 후 재시도")
@@ -326,6 +328,7 @@ class TikTokShopScraper:
             if await self._is_logged_in():
                 logger.info("프록시 로그인 세션으로 Seller Center 접근 성공!")
                 await self._dismiss_popups()
+                await self._save_cookies_to_file()
                 return True
 
         # 모두 실패 시 Slack 알림
@@ -396,25 +399,31 @@ class TikTokShopScraper:
         return False
 
     async def _do_login(self) -> bool:
-        """이메일/비밀번호 로그인 수행 (www.tiktok.com 우선 → seller center 폴백)
-
-        순서 이유: Seller Center 캡차 실패가 rate limit을 유발하므로,
-        캡차 없이 로그인할 수 있는 www.tiktok.com을 먼저 시도한다.
-        """
-        # 방법 1: www.tiktok.com 선행 로그인 (캡차 없이 로그인 가능성 높음)
-        logger.info("=== 방법 1: www.tiktok.com 선행 로그인 시도 ===")
-        success = await self._do_tiktok_com_login()
-        if success:
-            return True
-
-        # 방법 2: Seller Center 직접 로그인 (SSO iframe + 캡차)
-        logger.info("=== 방법 2: Seller Center 직접 로그인 폴백 ===")
+        """Seller Center 직접 로그인 수행 (SSO iframe + 캡차 처리)."""
+        # Seller Center 직접 로그인 (www.tiktok.com은 Seller Center 계정에서 항상 실패하므로 제거)
+        logger.info("=== Seller Center 직접 로그인 시도 ===")
         success = await self._do_seller_center_login()
         if success:
             return True
 
-        logger.error("모든 로그인 방법 실패")
+        logger.error("Seller Center 로그인 실패")
         return False
+
+    async def _save_cookies_to_file(self):
+        """현재 세션 쿠키를 JSON 파일로 백업."""
+        try:
+            cookies = await self._context.cookies()
+            tiktok_cookies = [c for c in cookies if "tiktok" in c.get("domain", "")]
+            SESSION_NAMES = ("sid_tt_tiktokseller", "sessionid_tiktokseller", "sid_tt", "sessionid")
+            has_session = any(c["name"] in SESSION_NAMES for c in tiktok_cookies)
+            if not has_session:
+                return
+            cookie_file = os.path.join(self.data_dir, "tiktok_cookies.json")
+            with open(cookie_file, "w") as f:
+                json.dump(tiktok_cookies, f, indent=2)
+            logger.info(f"세션 쿠키 백업 완료: {len(tiktok_cookies)}개 → {cookie_file}")
+        except Exception as e:
+            logger.warning(f"쿠키 백업 실패: {e}")
 
     async def _do_seller_center_login(self) -> bool:
         """Seller Center 직접 로그인 (기존 방식)"""
@@ -1061,6 +1070,15 @@ class TikTokShopScraper:
 
             await email_input.fill(self.email)
             await page.wait_for_timeout(500)
+            # fill() 후 값 검증 → React 이벤트 미전파 시 keyboard 타이핑 폴백
+            email_value = await email_input.evaluate("el => el.value")
+            if not email_value:
+                logger.info("  fill() 미반영 → keyboard 타이핑으로 재입력")
+                await email_input.click()
+                await email_input.evaluate("el => { el.value = ''; }")
+                for char in self.email:
+                    await page.keyboard.press(char)
+                    await page.wait_for_timeout(random.randint(30, 60))
             logger.info(f"  이메일 입력 완료")
 
             # 비밀번호 입력
@@ -1071,6 +1089,15 @@ class TikTokShopScraper:
 
             await pw_input.fill(self.password)
             await page.wait_for_timeout(500)
+            # fill() 후 값 검증 → keyboard 타이핑 폴백
+            pw_value = await pw_input.evaluate("el => el.value")
+            if not pw_value:
+                logger.info("  fill() 미반영 → keyboard 타이핑으로 재입력")
+                await pw_input.click()
+                await pw_input.evaluate("el => { el.value = ''; }")
+                for char in self.password:
+                    await page.keyboard.press(char)
+                    await page.wait_for_timeout(random.randint(30, 60))
             logger.info(f"  비밀번호 입력 완료")
 
             # 로그인 버튼 클릭
@@ -1624,6 +1651,7 @@ class TikTokShopScraper:
                 await page.wait_for_timeout(3000)
 
         logger.info(f"리뷰 수집 완료: 총 {len(all_reviews)}개")
+        await self._save_cookies_to_file()
         return all_reviews
 
     async def _parse_reviews_from_page(self) -> list[dict]:
