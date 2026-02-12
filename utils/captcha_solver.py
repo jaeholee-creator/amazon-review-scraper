@@ -5,8 +5,9 @@ TikTok Seller Center 로그인 시 나타나는 원형 퍼즐 캡차를 자동�
 배경 이미지의 갭 위치를 탐지하고 슬라이더를 인간처럼 드래그합니다.
 
 갭 위치 탐지 전략 (우선순위):
-1. SadCaptcha API ($0.002/건, 100% 정확도) - SADCAPTCHA_API_KEY 설정 시
-2. 로컬 에지 디텍션 (Pillow 기반) - 폴백
+1. EulerStream API (99.2% 정확도, 30-40ms) - EULER_STREAM_API_KEY 설정 시
+2. SadCaptcha API ($0.002/건) - SADCAPTCHA_API_KEY 설정 시 (폴백)
+3. 로컬 에지 디텍션 (Pillow 기반) - 최종 폴백
 """
 import asyncio
 import base64
@@ -27,6 +28,7 @@ class TikTokCaptchaSolver:
     """TikTok 슬라이더 퍼즐 캡차 자동 풀기"""
 
     MAX_RETRIES = 3  # rate limit 방지: 5 → 3
+    EULER_STREAM_API_URL = "https://tiktok.eulerstream.com/tiktok/captchas/puzzle"
     SADCAPTCHA_API_URL = "https://www.sadcaptcha.com/api/v1/puzzle"
 
     # DOM 셀렉터
@@ -173,22 +175,115 @@ class TikTokCaptchaSolver:
         """
         퍼즐 배경 이미지에서 갭 위치를 분석합니다.
 
-        1차: SadCaptcha API (100% 정확도, TikTok 전용)
-        2차 폴백: 로컬 이미지 분석 (에지 + 밝기 하이브리드)
+        1차: EulerStream API (99.2% 정확도, 30-40ms)
+        2차: SadCaptcha API (폴백)
+        3차 폴백: 로컬 이미지 분석 (에지 + 밝기 하이브리드)
 
         Returns:
             갭 위치의 비율 (0.0~1.0) 또는 None (분석 실패)
         """
-        # 1차: SadCaptcha API
-        api_key = os.environ.get("SADCAPTCHA_API_KEY", "")
-        if api_key:
-            result = await self._solve_with_sadcaptcha(api_key)
+        # 1차: EulerStream API
+        euler_key = os.environ.get("EULER_STREAM_API_KEY", "")
+        if euler_key:
+            result = await self._solve_with_eulerstream(euler_key)
+            if result is not None:
+                return result
+            logger.warning("EulerStream API 실패 → SadCaptcha 폴백 시도")
+
+        # 2차: SadCaptcha API
+        sad_key = os.environ.get("SADCAPTCHA_API_KEY", "")
+        if sad_key:
+            result = await self._solve_with_sadcaptcha(sad_key)
             if result is not None:
                 return result
             logger.warning("SadCaptcha API 실패 → 로컬 이미지 분석으로 폴백")
 
-        # 2차 폴백: 로컬 이미지 분석
+        # 3차 폴백: 로컬 이미지 분석
         return await self._local_image_analysis()
+
+    async def _solve_with_eulerstream(self, api_key: str) -> Optional[float]:
+        """EulerStream API로 퍼즐 x좌표를 획득하여 ratio로 변환.
+
+        API: https://tiktok.eulerstream.com/tiktok/captchas/puzzle
+        Auth: x-api-key header
+        Response: {"code": 200, "response": {"x": <pixel_position>, "time_ms": <ms>}}
+        """
+        try:
+            page = self.page
+            bg_img_el = await page.query_selector(self.BG_IMAGE_SEL)
+            piece_img_el = await page.query_selector(self.PIECE_IMAGE_SEL)
+            if not bg_img_el:
+                logger.warning("EulerStream: 배경 이미지 요소를 찾을 수 없음")
+                return None
+
+            bg_src = await bg_img_el.get_attribute("src")
+            if not bg_src or not bg_src.startswith("data:image"):
+                logger.warning("EulerStream: 배경 이미지가 data URI가 아님")
+                return None
+
+            _header, bg_b64 = bg_src.split(",", 1)
+
+            piece_b64 = None
+            if piece_img_el:
+                piece_src = await piece_img_el.get_attribute("src")
+                if piece_src and piece_src.startswith("data:image"):
+                    _, piece_b64 = piece_src.split(",", 1)
+
+            # 이미지 너비 측정 (ratio 계산용)
+            image_bytes = base64.b64decode(bg_b64)
+            bg_image = Image.open(io.BytesIO(image_bytes))
+            img_width = bg_image.width
+
+            # EulerStream API 호출 (multipart form data)
+            form = aiohttp.FormData()
+            form.add_field(
+                "puzzle_image",
+                base64.b64decode(bg_b64),
+                filename="puzzle.png",
+                content_type="image/png",
+            )
+            if piece_b64:
+                form.add_field(
+                    "piece_image",
+                    base64.b64decode(piece_b64),
+                    filename="piece.png",
+                    content_type="image/png",
+                )
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.EULER_STREAM_API_URL,
+                    headers={"x-api-key": api_key},
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"EulerStream API 오류: {resp.status} - {body}")
+                        return None
+
+                    data = await resp.json()
+
+            # 응답에서 x좌표 추출
+            response_data = data.get("response", data)
+            x_pos = response_data.get("x")
+            time_ms = response_data.get("time_ms", "?")
+
+            if x_pos is None:
+                logger.warning(f"EulerStream API: x좌표 없음 - {data}")
+                return None
+
+            ratio = x_pos / img_width
+            ratio = max(0.05, min(0.95, ratio))
+            logger.info(
+                f"EulerStream API 성공: x={x_pos}, width={img_width}, "
+                f"ratio={ratio:.3f}, time={time_ms}ms"
+            )
+            return ratio
+
+        except Exception as e:
+            logger.warning(f"EulerStream API 호출 실패: {e}")
+            return None
 
     async def _solve_with_sadcaptcha(self, api_key: str) -> Optional[float]:
         """SadCaptcha API로 퍼즐 x좌표를 획득하여 ratio로 변환."""

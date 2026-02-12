@@ -263,11 +263,16 @@ def get_shopee_collection_date_range():
 TIKTOK_EMAIL = os.getenv('TIKTOK_EMAIL', '')
 TIKTOK_PASSWORD = os.getenv('TIKTOK_PASSWORD', '')
 
-# Gmail IMAP (TikTok 인증 코드 자동 읽기용)
+# Gmail API (TikTok 인증 코드 자동 읽기용 - Service Account)
+TIKTOK_GMAIL_SERVICE_ACCOUNT_FILE = os.getenv('TIKTOK_GMAIL_SERVICE_ACCOUNT_FILE', '')
+TIKTOK_GMAIL_TARGET_EMAIL = os.getenv('TIKTOK_GMAIL_TARGET_EMAIL', '')
+# Gmail IMAP (레거시 폴백)
 TIKTOK_GMAIL_IMAP_EMAIL = os.getenv('TIKTOK_GMAIL_IMAP_EMAIL', '')
 TIKTOK_GMAIL_IMAP_APP_PASSWORD = os.getenv('TIKTOK_GMAIL_IMAP_APP_PASSWORD', '')
 
-# SadCaptcha API (TikTok 캡차 자동 풀기, $0.002/건, 100% 정확도)
+# EulerStream API (TikTok 캡차 자동 풀기, 99.2% 정확도, 30-40ms)
+EULER_STREAM_API_KEY = os.getenv('EULER_STREAM_API_KEY', '')
+# SadCaptcha API (폴백, $0.002/건)
 SADCAPTCHA_API_KEY = os.getenv('SADCAPTCHA_API_KEY', '')
 
 TIKTOK_SPREADSHEET_ID = '1NVUVShv5tAveINA9DdB2D21z71L3tF0In5JVK6LYX9s'

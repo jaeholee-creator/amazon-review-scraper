@@ -37,6 +37,8 @@ class TikTokShopScraper:
         password: str,
         data_dir: str = "data/tiktok",
         headless: bool = True,
+        gmail_service_account_file: str = "",
+        gmail_target_email: str = "",
         gmail_imap_email: str = "",
         gmail_imap_app_password: str = "",
     ):
@@ -46,13 +48,17 @@ class TikTokShopScraper:
             password: 비밀번호
             data_dir: 데이터 저장 디렉토리 (쿠키, 로그 등)
             headless: 헤드리스 모드 여부
-            gmail_imap_email: Gmail IMAP 이메일 주소 (인증 코드 자동 읽기용)
-            gmail_imap_app_password: Gmail App Password (2FA 후 생성)
+            gmail_service_account_file: Google Service Account JSON 경로 (2FA 코드 자동 읽기)
+            gmail_target_email: 인증 코드를 받는 Gmail 주소
+            gmail_imap_email: Gmail IMAP 이메일 주소 (폴백용)
+            gmail_imap_app_password: Gmail App Password (폴백용)
         """
         self.email = email
         self.password = password
         self.data_dir = data_dir
         self.headless = headless
+        self.gmail_service_account_file = gmail_service_account_file
+        self.gmail_target_email = gmail_target_email
         self.gmail_imap_email = gmail_imap_email
         self.gmail_imap_app_password = gmail_imap_app_password
 
@@ -993,8 +999,10 @@ class TikTokShopScraper:
             await page.wait_for_timeout(5000)
             return await self._is_logged_in()
 
-        # 2. Gmail IMAP으로 인증 코드 자동 읽기
-        if self.gmail_imap_email and self.gmail_imap_app_password:
+        # 2. Gmail API/IMAP으로 인증 코드 자동 읽기
+        has_gmail = (self.gmail_service_account_file and self.gmail_target_email) or \
+                    (self.gmail_imap_email and self.gmail_imap_app_password)
+        if has_gmail:
             code = await self._get_code_from_gmail()
             if code:
                 logger.info(f"Gmail IMAP에서 인증 코드 획득: {code}")
@@ -1025,21 +1033,24 @@ class TikTokShopScraper:
         return False
 
     async def _get_code_from_gmail(self) -> Optional[str]:
-        """Gmail IMAP을 사용하여 TikTok 인증 코드를 읽어옵니다."""
+        """Gmail API 또는 IMAP을 사용하여 TikTok 인증 코드를 읽어옵니다."""
         try:
             from utils.gmail_code_reader import GmailVerificationCodeReader
 
             reader = GmailVerificationCodeReader(
+                service_account_file=self.gmail_service_account_file,
+                target_email=self.gmail_target_email,
                 imap_email=self.gmail_imap_email,
                 imap_app_password=self.gmail_imap_app_password,
             )
 
-            logger.info("Gmail IMAP으로 인증 코드 이메일 폴링 시작...")
+            method = "Gmail API" if self.gmail_service_account_file else "IMAP"
+            logger.info(f"{method}로 인증 코드 이메일 폴링 시작...")
             code = await reader.async_wait_for_verification_code(timeout=120, poll_interval=5)
             return code
 
         except Exception as e:
-            logger.error(f"Gmail IMAP 인증 코드 읽기 실패: {e}")
+            logger.error(f"Gmail 인증 코드 읽기 실패: {e}")
             return None
 
     async def _input_verification_code(self, code: str):
