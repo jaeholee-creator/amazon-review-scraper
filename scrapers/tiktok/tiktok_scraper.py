@@ -552,8 +552,8 @@ class TikTokShopScraper:
                 }
             """, text)
         else:
-            # press_sequentially로 실제 키보드 이벤트 발생 (React가 인식)
-            await element.press_sequentially(text, delay=50)
+            # ElementHandle.type()로 실제 키보드 이벤트 발생 (React가 인식)
+            await element.type(text, delay=50)
 
         await page.wait_for_timeout(300)
 
