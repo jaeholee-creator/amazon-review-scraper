@@ -107,17 +107,23 @@ with DAG(
     # =========================================================================
     # Task 5: TikTok Shop 리뷰 수집
     # =========================================================================
-    tiktok = BashOperator(
-        task_id='tiktok_reviews',
-        bash_command=_build_bash_command('tiktok_daily_scraper.py'),
-        env={
-            **common_env,
-            'TIKTOK_HEADLESS': 'true',
-        },
-        append_env=True,
-        execution_timeout=timedelta(minutes=30),
-        retries=2,
-    )
+    # TEMPORARILY DISABLED: Rate limit 차단으로 인해 일시 중지 (2026-02-12)
+    # 해결 방법:
+    #   1. 24-48시간 대기 후 Rate Limit 해제 확인
+    #   2. 프록시 서버 사용 고려
+    #   3. User-Agent 변경 및 요청 간격 증가
+    # 재활성화 시: 아래 주석 해제
+    # tiktok = BashOperator(
+    #     task_id='tiktok_reviews',
+    #     bash_command=_build_bash_command('tiktok_daily_scraper.py'),
+    #     env={
+    #         **common_env,
+    #         'TIKTOK_HEADLESS': 'true',
+    #     },
+    #     append_env=True,
+    #     execution_timeout=timedelta(minutes=30),
+    #     retries=2,
+    # )
 
     # =========================================================================
     # Task 6: 완료 알림
@@ -131,6 +137,7 @@ with DAG(
     # =========================================================================
     # Task 의존성 (병렬 실행 → 완료 알림)
     # =========================================================================
-    # Amazon US/UK, Biodance, Shopee, TikTok → 모두 병렬 실행
+    # Amazon US/UK, Biodance, Shopee → 병렬 실행
+    # TikTok은 임시 비활성화 (Rate Limit)
     # 전부 끝나면 → notify_completion
-    [amazon_us, amazon_uk, biodance, shopee, tiktok] >> notify_completion
+    [amazon_us, amazon_uk, biodance, shopee] >> notify_completion

@@ -175,6 +175,46 @@ PRODUCT_NAMES = {
 }
 
 # =============================================================================
+# LOAD ALL PRODUCTS FROM CSV
+# =============================================================================
+def get_all_asins_from_csv():
+    """
+    products.csv에서 모든 ASIN 로드 (전체 제품 크롤링용)
+
+    Returns:
+        list: ASIN 리스트
+    """
+    import csv
+    import os
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'products.csv')
+    asins = []
+    names = {}
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                asin = row.get('asin', '').strip()
+                name = row.get('name', '').strip()
+                if asin:
+                    asins.append(asin)
+                    if name:
+                        names[asin] = name
+        return asins, names
+    except FileNotFoundError:
+        import logging
+        logging.getLogger(__name__).warning(f"products.csv not found at {csv_path}, falling back to TOP_5_ASINS")
+        return TOP_5_ASINS, PRODUCT_NAMES
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error loading products.csv: {e}, falling back to TOP_5_ASINS")
+        return TOP_5_ASINS, PRODUCT_NAMES
+
+# 전체 제품 로드 (기본 동작)
+ALL_ASINS, ALL_PRODUCT_NAMES = get_all_asins_from_csv()
+
+# =============================================================================
 # SHOPEE CONFIGURATION
 # =============================================================================
 SHOPEE_SHOPS = {

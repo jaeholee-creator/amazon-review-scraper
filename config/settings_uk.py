@@ -107,3 +107,43 @@ SHEET_NAME = 'UK_amazone'
 # =============================================================================
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN', '')
 SLACK_CHANNEL_ID = os.getenv('SLACK_CHANNEL_ID', '')
+
+# =============================================================================
+# LOAD ALL PRODUCTS FROM CSV (UK)
+# =============================================================================
+def get_all_asins_from_csv():
+    """
+    products_uk.csv에서 모든 ASIN 로드 (전체 제품 크롤링용)
+
+    Returns:
+        tuple: (ASIN 리스트, PRODUCT_NAMES 딕셔너리)
+    """
+    import csv
+    import os
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'products_uk.csv')
+    asins = []
+    names = {}
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                asin = row.get('asin', '').strip()
+                name = row.get('name', '').strip()
+                if asin:
+                    asins.append(asin)
+                    if name:
+                        names[asin] = name
+        return asins, names
+    except FileNotFoundError:
+        import logging
+        logging.getLogger(__name__).warning(f"products_uk.csv not found at {csv_path}")
+        return [], {}
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error loading products_uk.csv: {e}")
+        return [], {}
+
+# 전체 제품 로드 (기본 동작)
+ALL_ASINS, ALL_PRODUCT_NAMES = get_all_asins_from_csv()

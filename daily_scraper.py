@@ -32,19 +32,20 @@ def load_config(region: str) -> dict:
             MAX_DELAY,
             GOOGLE_SHEETS_URL,
             SHEET_NAME,
+            ALL_ASINS,
+            ALL_PRODUCT_NAMES,
             get_collection_date_range,
             get_collection_date_range_str,
             get_run_date_str,
         )
-        from config.settings import PRODUCT_NAMES, TOP_5_ASINS
     else:
         from config.settings import (
             MIN_DELAY,
             MAX_DELAY,
             GOOGLE_SHEETS_URL,
             SHEET_NAME,
-            PRODUCT_NAMES,
-            TOP_5_ASINS,
+            ALL_ASINS,
+            ALL_PRODUCT_NAMES,
             get_collection_date_range,
             get_collection_date_range_str,
             get_run_date_str,
@@ -55,8 +56,8 @@ def load_config(region: str) -> dict:
         'max_delay': MAX_DELAY,
         'google_sheets_url': GOOGLE_SHEETS_URL,
         'sheet_name': SHEET_NAME,
-        'product_names': PRODUCT_NAMES,
-        'top_asins': TOP_5_ASINS,
+        'product_names': ALL_PRODUCT_NAMES,
+        'all_asins': ALL_ASINS,
         'get_collection_date_range': get_collection_date_range,
         'get_collection_date_range_str': get_collection_date_range_str,
         'get_run_date_str': get_run_date_str,
@@ -100,7 +101,7 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
     cfg = load_config(region)
 
     product_names = cfg['product_names']
-    asin_list = list(cfg['top_asins'])
+    asin_list = list(cfg['all_asins'])
     if limit:
         asin_list = asin_list[:limit]
 
