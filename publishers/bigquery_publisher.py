@@ -111,7 +111,7 @@ class BigQueryPublisher:
             "product_name": _to_str(review.get("product_name")),
             "product_id": _to_str(review.get("product_id")),
             "author": _to_str(review.get("author")),
-            "author_country": _to_str(review.get("author_country")) or _default_country(platform),
+            "author_country": _normalize_country(review.get("author_country"), platform),
             "star": _to_float(review.get("star")),
             "title": _to_str(review.get("title")),
             "content": _to_str(review.get("content")),
@@ -223,10 +223,24 @@ class BigQueryPublisher:
 # 유틸리티 함수
 # =====================================================================
 
-def _default_country(platform: str) -> Optional[str]:
-    """플랫폼별 기본 국가 코드 반환 (author_country가 NULL일 때)"""
-    defaults = {"tiktok": "US"}
-    return defaults.get(platform)
+_COUNTRY_NORMALIZE = {
+    "United States": "US",
+    "United Kingdom": "UK",
+    "united states": "US",
+    "united kingdom": "UK",
+}
+
+_PLATFORM_DEFAULT_COUNTRY = {
+    "tiktok": "US",
+}
+
+
+def _normalize_country(value: Any, platform: str) -> Optional[str]:
+    """국가명을 ISO 2자리 코드로 정규화하고, 없으면 플랫폼 기본값 반환"""
+    s = _to_str(value)
+    if s:
+        return _COUNTRY_NORMALIZE.get(s, s)
+    return _PLATFORM_DEFAULT_COUNTRY.get(platform)
 
 
 def _to_str(value: Any) -> Optional[str]:
