@@ -83,6 +83,16 @@ COLUMN_MAPPINGS = {
     },
 }
 
+# 시트명 → platform_country 매핑
+SHEET_PLATFORM_COUNTRY = {
+    "US자사몰": "US",
+    "US_amazone": "US",
+    "UK_amazone": "UK",
+    "SG_shopee": "SG",
+    "PH_shopee": "PH",
+    "US_TIkTOK": "US",
+}
+
 
 def get_sheets_client() -> gspread.Client:
     """Google Sheets 인증"""
@@ -138,6 +148,11 @@ def migrate_sheet(
         # review_id가 비어있는 행은 건너뛰기
         if not review.get("review_id"):
             continue
+
+        # 시트명 기반 platform_country 설정 (데이터에 없는 경우)
+        if not review.get("platform_country"):
+            review["platform_country"] = SHEET_PLATFORM_COUNTRY.get(sheet_name, "")
+
         reviews.append(review)
 
     logger.info("[%s] %d개 유효 리뷰 (review_id 있음)", platform, len(reviews))
