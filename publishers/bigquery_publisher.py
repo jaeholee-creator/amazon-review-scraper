@@ -111,7 +111,7 @@ class BigQueryPublisher:
             "product_name": _to_str(review.get("product_name")),
             "product_id": _to_str(review.get("product_id")),
             "author": _to_str(review.get("author")),
-            "author_country": _to_str(review.get("author_country")),
+            "author_country": _to_str(review.get("author_country")) or _default_country(platform),
             "star": _to_float(review.get("star")),
             "title": _to_str(review.get("title")),
             "content": _to_str(review.get("content")),
@@ -222,6 +222,12 @@ class BigQueryPublisher:
 # =====================================================================
 # 유틸리티 함수
 # =====================================================================
+
+def _default_country(platform: str) -> Optional[str]:
+    """플랫폼별 기본 국가 코드 반환 (author_country가 NULL일 때)"""
+    defaults = {"tiktok": "US"}
+    return defaults.get(platform)
+
 
 def _to_str(value: Any) -> Optional[str]:
     if value is None or value == "" or value == 0:
