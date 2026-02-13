@@ -12,10 +12,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-try:
-    from patchright.async_api import async_playwright, Page, BrowserContext
-except ImportError:
-    from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page, BrowserContext
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +34,6 @@ class TikTokShopScraper:
         password: str,
         data_dir: str = "data/tiktok",
         headless: bool = True,
-        gmail_service_account_file: str = "",
-        gmail_target_email: str = "",
         gmail_imap_email: str = "",
         gmail_imap_app_password: str = "",
     ):
@@ -48,17 +43,13 @@ class TikTokShopScraper:
             password: 비밀번호
             data_dir: 데이터 저장 디렉토리 (쿠키, 로그 등)
             headless: 헤드리스 모드 여부
-            gmail_service_account_file: Google Service Account JSON 경로 (2FA 코드 자동 읽기)
-            gmail_target_email: 인증 코드를 받는 Gmail 주소
-            gmail_imap_email: Gmail IMAP 이메일 주소 (폴백용)
-            gmail_imap_app_password: Gmail App Password (폴백용)
+            gmail_imap_email: Gmail IMAP 이메일 주소 (인증 코드 자동 읽기용)
+            gmail_imap_app_password: Gmail App Password (2FA 후 생성)
         """
         self.email = email
         self.password = password
         self.data_dir = data_dir
         self.headless = headless
-        self.gmail_service_account_file = gmail_service_account_file
-        self.gmail_target_email = gmail_target_email
         self.gmail_imap_email = gmail_imap_email
         self.gmail_imap_app_password = gmail_imap_app_password
 
@@ -95,27 +86,64 @@ class TikTokShopScraper:
             profile_dir,
             headless=use_headless,
             viewport={"width": 1440, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/133.0.0.0 Safari/537.36"
+            ),
             locale="en-US",
             timezone_id="America/New_York",
             args=[
+                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                # SSO iframe 크로스 오리진 지원
-                "--disable-features=IsolateOrigins,site-per-process,SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure,ThirdPartyCookieBlocking,ImprovedCookieControls",
-                "--disable-site-isolation-trials",
-                "--disable-web-security",
             ],
-            bypass_csp=True,
+            ignore_default_args=["--enable-automation"],
         )
         self._browser = None  # persistent context는 browser 객체 없음
 
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
-        # Patchright 사용 시 stealth 불필요 (CDP 프로토콜 레벨에서 자동 처리)
-        logger.info("Patchright 브라우저 시작 완료 (anti-bot 자동 우회)")
+        # playwright-stealth 적용 (봇 탐지 우회)
+        try:
+            # v2.x API: Stealth 클래스 사용
+            from playwright_stealth import Stealth
+            stealth = Stealth()
+            await stealth.apply_stealth_async(self._page)
+            logger.info("playwright-stealth v2 적용 완료")
+        except (ImportError, AttributeError):
+            try:
+                # v1.x API: stealth_async 함수 사용
+                from playwright_stealth import stealth_async
+                await stealth_async(self._page)
+                logger.info("playwright-stealth v1 적용 완료")
+            except ImportError:
+                logger.warning("playwright-stealth 미설치 - 수동 스텔스 적용")
+                await self._apply_manual_stealth()
 
-        # JSON 쿠키 파일에서 세션 복원 (수동 로그인으로 추출한 쿠키)
-        await self._load_cookies_from_file()
+        # 추가 CDP 흔적 제거 (stealth가 커버하지 못하는 영역)
+        await self._context.add_init_script("""
+            // CDP Runtime.enable 흔적 제거
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+            // permissions.query 오버라이드 (headless 탐지 방지)
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+
+            // WebGL vendor/renderer spoofing
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, parameter);
+            };
+        """)
 
         # 로그인 시도
         logged_in = await self._ensure_logged_in()
@@ -163,123 +191,17 @@ class TikTokShopScraper:
     # Cookie / Session Management
     # =========================================================================
     # 영구 브라우저 프로필 사용 → 쿠키/localStorage/sessionStorage 자동 유지
-    # 수동 로그인으로 추출한 JSON 쿠키 파일을 프로필에 주입 가능
-
-    async def _load_cookies_from_file(self):
-        """JSON 쿠키 파일에서 세션 쿠키를 로드하여 브라우저 컨텍스트에 주입.
-
-        수동 로그인으로 추출한 쿠키를 EC2 프로필에 복원하는 용도.
-        이미 유효한 세션 쿠키가 있으면 스킵.
-        """
-        import json
-
-        cookie_file = os.path.join(self.data_dir, "tiktok_cookies.json")
-        if not os.path.exists(cookie_file):
-            return
-
-        # 이미 세션 쿠키가 있으면 파일 로드 스킵
-        existing = await self._context.cookies()
-        has_session = any(c["name"] in ("sid_tt", "sessionid",
-                                        "sid_tt_tiktokseller", "sessionid_tiktokseller")
-                         for c in existing)
-        if has_session:
-            logger.info("기존 세션 쿠키 존재 → JSON 쿠키 로드 스킵")
-            return
-
-        try:
-            with open(cookie_file, "r") as f:
-                cookies = json.load(f)
-
-            if not cookies:
-                return
-
-            # Playwright add_cookies 형식으로 변환
-            valid_cookies = []
-            for c in cookies:
-                cookie = {
-                    "name": c["name"],
-                    "value": c["value"],
-                    "domain": c["domain"],
-                    "path": c.get("path", "/"),
-                }
-                if c.get("expires", -1) > 0:
-                    cookie["expires"] = c["expires"]
-                if c.get("httpOnly"):
-                    cookie["httpOnly"] = True
-                if c.get("secure"):
-                    cookie["secure"] = True
-                if c.get("sameSite"):
-                    cookie["sameSite"] = c["sameSite"]
-                valid_cookies.append(cookie)
-
-            await self._context.add_cookies(valid_cookies)
-            logger.info(f"JSON 쿠키 파일에서 {len(valid_cookies)}개 쿠키 로드 완료")
-
-        except Exception as e:
-            logger.warning(f"JSON 쿠키 로드 실패 (무시): {e}")
+    # 별도 쿠키 파일 저장 불필요
 
     # =========================================================================
     # Login
     # =========================================================================
 
-    async def _check_session_health(self) -> dict:
-        """세션 쿠키 유효성 및 남은 수명 확인"""
-        cookies = await self._context.cookies()
-        session_info = {}
-
-        for cookie in cookies:
-            if cookie["name"] in ("sid_tt", "sessionid", "sessionid_ss", "sid_guard",
-                                    "sid_tt_tiktokseller", "sessionid_tiktokseller",
-                                    "sessionid_ss_tiktokseller", "sid_guard_tiktokseller"):
-                expires = cookie.get("expires", 0)
-                if expires > 0:
-                    expire_dt = datetime.fromtimestamp(expires)
-                    remaining = (expire_dt - datetime.now()).days
-                    session_info[cookie["name"]] = {
-                        "expires": expire_dt.isoformat(),
-                        "remaining_days": remaining,
-                        "healthy": remaining > 7,
-                    }
-
-        return session_info
-
-    def _notify_session_expiring(self, session_info: dict):
-        """세션 만료 7일 전 Slack 알림 (1회 통합 발송)"""
-        expiring = {name: info for name, info in session_info.items()
-                    if not info.get("healthy", True)}
-        if not expiring:
-            return
-
-        min_days = min(info["remaining_days"] for info in expiring.values())
-        details = "\n".join(f"  - {name}: {info['remaining_days']}일 남음 ({info['expires']})"
-                           for name, info in expiring.items())
-        try:
-            from src.slack_notifier import SlackNotifier
-            notifier = SlackNotifier()
-            notifier.send_error_alert(
-                f"TikTok 세션 만료 임박! ({min_days}일 남음)\n{details}\n"
-                f"로컬에서 수동 로그인 후 쿠키를 EC2에 업로드 필요"
-            )
-            logger.warning(f"세션 만료 임박 Slack 알림 전송: {len(expiring)}개 쿠키, 최소 {min_days}일 남음")
-        except Exception as e:
-            logger.warning(f"세션 만료 Slack 알림 실패: {e}")
-
     async def _ensure_logged_in(self) -> bool:
-        """세션 쿠키 우선 확인 → 유효하면 로그인 건너뜀 → 만료 시 자동 로그인 시도"""
+        """로그인 상태 확인 및 필요시 로그인 수행 (최대 2회 시도)"""
         page = self._page
 
-        # 1단계: 세션 쿠키 존재 여부 빠른 체크
-        cookies = await self._context.cookies()
-        has_session = any(c["name"] in ("sid_tt", "sessionid",
-                                        "sid_tt_tiktokseller", "sessionid_tiktokseller") for c in cookies)
-
-        if has_session:
-            # 세션 만료 모니터링
-            session_info = await self._check_session_health()
-            if any(not info.get("healthy", True) for info in session_info.values()):
-                self._notify_session_expiring(session_info)
-
-        # 2단계: Rating 페이지로 이동하여 세션 실제 유효성 확인
+        # Rating 페이지로 이동하여 세션 확인
         logger.info("Seller Center 접속 시도...")
         await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
 
@@ -290,48 +212,24 @@ class TikTokShopScraper:
             if await self._is_logged_in():
                 logger.info("기존 세션으로 로그인 확인됨 (캡차/로그인 건너뜀)")
                 await self._dismiss_popups()
-                await self._save_cookies_to_file()
                 return True
             current_url = page.url
             if "/account/login" in current_url or "/account/register" in current_url:
                 break
 
-        # 3단계: 세션 만료 — 자동 로그인 허용 여부 확인
-        auto_login = os.environ.get("TIKTOK_AUTO_LOGIN", "true").lower() == "true"
-        if not auto_login:
-            logger.error("세션 만료 - 수동 로그인 필요 (TIKTOK_AUTO_LOGIN=false)")
-            self._notify_captcha_failure()
-            return False
+        logger.info("세션 만료. 재로그인 진행...")
 
-        logger.info("세션 만료. 자동 로그인 진행...")
-
-        # 최대 2회 직접 로그인 시도
+        # 최대 2회 로그인 시도
         for attempt in range(1, 3):
-            logger.info(f"직접 로그인 시도 {attempt}/2")
+            logger.info(f"로그인 시도 {attempt}/2")
             success = await self._do_login()
             if success:
-                await self._save_cookies_to_file()
                 return True
             if attempt < 2:
                 logger.info("로그인 실패 - 5초 후 재시도")
                 await page.wait_for_timeout(5000)
 
-        # 4단계: 직접 로그인 실패 → 프록시 로그인 시도
-        logger.info("직접 로그인 실패 → 무료 프록시로 로그인 시도...")
-        proxy_success = await self._login_with_proxy()
-        if proxy_success:
-            # 프록시에서 얻은 쿠키를 메인 컨텍스트에 로드
-            await self._load_cookies_from_file()
-            # Seller Center 재접속
-            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)
-            if await self._is_logged_in():
-                logger.info("프록시 로그인 세션으로 Seller Center 접근 성공!")
-                await self._dismiss_popups()
-                await self._save_cookies_to_file()
-                return True
-
-        # 모두 실패 시 Slack 알림
+        # 2회 모두 실패 시 Slack 알림
         self._notify_captcha_failure()
         return False
 
@@ -382,142 +280,225 @@ class TikTokShopScraper:
         if seller_indicators:
             return True
 
-        # URL 패턴 + 페이지 길이 기반 판단
-        # 인증된 Seller Center 페이지는 최소 5000자 이상의 콘텐츠를 가짐
+        # URL 패턴 기반 판단
         if "seller-us.tiktok.com" in current_url:
             logged_in_paths = ["/homepage", "/product/", "/order/", "/dashboard", "/finance/"]
             for path in logged_in_paths:
                 if path in current_url:
-                    try:
-                        body_len = await page.evaluate("() => document.body.innerText.length")
-                        if body_len > 5000:
-                            return True
-                        logger.debug(f"URL 매칭이지만 콘텐츠 짧음 ({body_len}자). 미인증 가능.")
-                    except Exception:
-                        pass
+                    # URL이 내부 경로에 매칭 + 로그인 폼/공개 시그널 없음 → 로그인 상태
+                    logger.info(f"URL 매칭으로 로그인 확인: {current_url[:80]}")
+                    return True
 
         return False
 
     async def _do_login(self) -> bool:
-        """Seller Center 직접 로그인 수행 (SSO iframe + 캡차 처리)."""
-        # Seller Center 직접 로그인 (www.tiktok.com은 Seller Center 계정에서 항상 실패하므로 제거)
-        logger.info("=== Seller Center 직접 로그인 시도 ===")
-        success = await self._do_seller_center_login()
-        if success:
-            return True
-
-        logger.error("Seller Center 로그인 실패")
-        return False
-
-    async def _save_cookies_to_file(self):
-        """현재 세션 쿠키를 JSON 파일로 백업."""
-        try:
-            cookies = await self._context.cookies()
-            tiktok_cookies = [c for c in cookies if "tiktok" in c.get("domain", "")]
-            SESSION_NAMES = ("sid_tt_tiktokseller", "sessionid_tiktokseller", "sid_tt", "sessionid")
-            has_session = any(c["name"] in SESSION_NAMES for c in tiktok_cookies)
-            if not has_session:
-                return
-            cookie_file = os.path.join(self.data_dir, "tiktok_cookies.json")
-            with open(cookie_file, "w") as f:
-                json.dump(tiktok_cookies, f, indent=2)
-            logger.info(f"세션 쿠키 백업 완료: {len(tiktok_cookies)}개 → {cookie_file}")
-        except Exception as e:
-            logger.warning(f"쿠키 백업 실패: {e}")
-
-    async def _do_seller_center_login(self) -> bool:
-        """Seller Center 직접 로그인 (기존 방식)"""
+        """이메일/비밀번호 로그인 수행 (순수 키보드 이벤트 사용)"""
         page = self._page
 
         try:
-            await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            # 로그인 페이지로 이동 (register 리다이렉트 대비)
+            try:
+                await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                # register로 리다이렉트될 수 있음
+                logger.info(f"로그인 페이지 이동 중 리다이렉트: {e}")
+                await page.wait_for_timeout(3000)
+
             await page.wait_for_timeout(3000)
 
-            # "Log in" 탭으로 전환 (기본이 Sign up일 수 있음)
+            # register 페이지면 "Log in" 링크 클릭
+            current_url = page.url
+            if "/account/register" in current_url:
+                logger.info("Register 페이지 감지 → Log in 링크 클릭")
+                # 상단 네비게이션의 "Log in" 링크
+                login_link = await page.query_selector('a[href*="/account/login"]')
+                if login_link:
+                    await login_link.click()
+                    await page.wait_for_timeout(3000)
+                else:
+                    # 텍스트로 찾기
+                    for sel in ['text="Log in"', 'a:has-text("Log in")']:
+                        el = await page.query_selector(sel)
+                        if el:
+                            await el.click()
+                            await page.wait_for_timeout(3000)
+                            break
+
+            # "Log in" 탭 활성화 (Sign up 폼이 기본일 수 있음)
             for selector in [
-                'a[href*="/account/login"]',
+                'div[role="tab"]:has-text("Log in")',
                 'div:has-text("Log in") >> nth=0',
                 'span:has-text("Log in")',
-                'button:has-text("Log in")',
             ]:
-                login_tab = await page.query_selector(selector)
-                if login_tab:
-                    await login_tab.click()
-                    logger.info(f"Log in 탭 클릭: {selector}")
-                    await page.wait_for_timeout(2000)
-                    break
+                try:
+                    login_tab = await page.query_selector(selector)
+                    if login_tab and await login_tab.is_visible():
+                        await login_tab.click()
+                        logger.info(f"Log in 탭 클릭: {selector}")
+                        await page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    continue
 
-            # Email 탭 선택
+            # Email 탭 선택 (Phone이 기본일 수 있음)
             email_tab = await page.query_selector('[data-tid="emailTab"], [id*="email"]')
             if email_tab:
                 await email_tab.click()
                 await page.wait_for_timeout(1000)
 
-            # 이메일 입력 (React controlled component 대응)
-            email_input = await page.query_selector(
-                'input[name="email"], input[type="email"], input[placeholder*="email" i]'
-            )
-            if email_input:
-                await self._react_safe_input(email_input, self.email)
-                logger.info(f"이메일 입력: {self.email}")
-            else:
-                logger.error("이메일 입력 필드를 찾을 수 없음")
-                return False
-
-            # 비밀번호 입력 (React controlled component 대응)
-            password_input = await page.query_selector(
-                'input[name="password"], input[type="password"]'
-            )
-            if password_input:
-                await self._react_safe_input(password_input, self.password)
-                logger.info("비밀번호 입력 완료")
-            else:
-                logger.error("비밀번호 입력 필드를 찾을 수 없음")
-                return False
-
-            # 입력값 검증 (React state 동기화 확인)
-            email_value = await email_input.evaluate("el => el.value")
-            password_value = await password_input.evaluate("el => el.value")
-            if email_value != self.email or password_value != self.password:
-                logger.warning(f"입력값 불일치 감지 - 재입력 시도 (email: '{email_value}' vs '{self.email}')")
-                await self._react_safe_input(email_input, self.email, force_events=True)
-                await self._react_safe_input(password_input, self.password, force_events=True)
-
-            # 로그인 버튼 클릭 (다양한 방법 시도)
-            login_clicked = await self._click_login_button()
-            if not login_clicked:
-                logger.error("로그인 버튼을 찾을 수 없음")
-                return False
-
-            await page.wait_for_timeout(5000)
-            logger.info(f"로그인 버튼 클릭 후 URL: {page.url}")
-
-            # 네트워크 요청 확인: 인증 API 호출이 발생했는지 체크
-            # SSO iframe이 로드되지 않으면 인증 API 호출 0건
-            auth_api_detected = await page.evaluate("""
-                () => {
-                    const entries = performance.getEntriesByType('resource');
-                    const authCalls = entries.filter(e =>
-                        e.name.includes('/passport/') ||
-                        e.name.includes('/api/login') ||
-                        e.name.includes('/sso/') ||
-                        e.name.includes('/ucenter_web/')
-                    );
-                    return authCalls.length;
-                }
+            # === 핵심: Locator API + React native setter로 입력 ===
+            # 디버그: 현재 페이지의 모든 input 필드 확인
+            inputs_info = await page.evaluate("""
+                () => Array.from(document.querySelectorAll('input')).map(el => ({
+                    name: el.name, type: el.type, visible: el.offsetParent !== null,
+                    placeholder: el.placeholder, cls: (el.className || '').substring(0, 80)
+                }))
             """)
-            logger.info(f"인증 API 호출 수: {auth_api_detected}")
+            logger.info(f"페이지 input 필드: {inputs_info}")
 
-            if auth_api_detected == 0:
-                logger.warning("인증 API 호출 0건 - SSO iframe 로딩 실패 가능성 높음")
-                # 10초 더 대기 후 재확인
-                await page.wait_for_timeout(10000)
-                if not await self._is_logged_in():
-                    logger.warning("Seller Center 직접 로그인 실패 (SSO iframe 문제)")
-                    return False
+            # 이메일 입력: Locator로 가시적인 이메일 필드 찾기
+            email_selectors = [
+                'input[name="email"]:visible',
+                'input[type="email"]:visible',
+                'input[placeholder*="email" i]:visible',
+            ]
+            email_filled = False
+            for sel in email_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    if await locator.count() > 0:
+                        # 방법 1: Locator.fill() - Playwright가 React 이벤트도 트리거
+                        await locator.fill(self.email)
+                        await page.wait_for_timeout(300)
+                        val = await locator.input_value()
+                        if val == self.email:
+                            logger.info(f"이메일 Locator.fill() 성공: {sel}")
+                            email_filled = True
+                            break
+                        # 방법 2: Native setter + React event dispatch
+                        logger.info(f"fill() 값 불일치 '{val}' - native setter 시도")
+                        await locator.evaluate("""
+                            (el, text) => {
+                                const nativeSetter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value'
+                                ).set;
+                                nativeSetter.call(el, text);
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        """, self.email)
+                        await page.wait_for_timeout(300)
+                        val = await locator.input_value()
+                        if val == self.email:
+                            logger.info(f"이메일 native setter 성공: {sel}")
+                            email_filled = True
+                            break
+                        # 방법 3: press_sequentially (실제 키 이벤트)
+                        logger.info(f"native setter 후 값 '{val}' - press_sequentially 시도")
+                        await locator.click()
+                        await page.keyboard.press("Control+a")
+                        await locator.press_sequentially(self.email, delay=50)
+                        await page.wait_for_timeout(300)
+                        val = await locator.input_value()
+                        if val == self.email:
+                            logger.info(f"이메일 press_sequentially 성공: {sel}")
+                            email_filled = True
+                            break
+                        logger.warning(f"이메일 입력 모든 방법 실패: '{val}'")
+                except Exception as e:
+                    logger.debug(f"이메일 셀렉터 {sel} 실패: {e}")
 
-            # 캡차 + 인증 코드 처리 (rate limit 방지: 최대 2라운드)
-            for captcha_round in range(2):
+            if not email_filled:
+                logger.error("이메일 입력 실패 - 모든 방법 시도 완료")
+                await page.screenshot(path=f"{self.data_dir}/debug_email_fail.png")
+                return False
+
+            # 비밀번호 입력: 같은 전략
+            pw_selectors = [
+                'input[type="password"]:visible',
+                'input[name="password"]:visible',
+            ]
+            pw_filled = False
+            for sel in pw_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    if await locator.count() > 0:
+                        await locator.fill(self.password)
+                        await page.wait_for_timeout(300)
+                        val = await locator.input_value()
+                        if val == self.password:
+                            logger.info(f"비밀번호 Locator.fill() 성공")
+                            pw_filled = True
+                            break
+                        # Native setter fallback
+                        await locator.evaluate("""
+                            (el, text) => {
+                                const nativeSetter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value'
+                                ).set;
+                                nativeSetter.call(el, text);
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        """, self.password)
+                        await page.wait_for_timeout(300)
+                        val = await locator.input_value()
+                        if val == self.password:
+                            logger.info("비밀번호 native setter 성공")
+                            pw_filled = True
+                            break
+                        # press_sequentially fallback
+                        await locator.click()
+                        await page.keyboard.press("Control+a")
+                        await locator.press_sequentially(self.password, delay=50)
+                        await page.wait_for_timeout(300)
+                        val = await locator.input_value()
+                        if val == self.password:
+                            logger.info("비밀번호 press_sequentially 성공")
+                            pw_filled = True
+                            break
+                except Exception as e:
+                    logger.debug(f"비밀번호 셀렉터 {sel} 실패: {e}")
+
+            if not pw_filled:
+                logger.error("비밀번호 입력 실패")
+                return False
+
+            # 스크린샷: Continue 클릭 전
+            await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
+
+            # Continue 버튼 클릭
+            continue_btn = page.locator('button:has-text("Continue"):visible').first
+            if await continue_btn.count() > 0:
+                is_disabled = await continue_btn.evaluate("el => el.disabled")
+                logger.info(f"Continue 버튼: disabled={is_disabled}")
+                await continue_btn.click()
+                logger.info("Continue 버튼 클릭 완료")
+            else:
+                logger.info("Continue 버튼 미발견 - Enter 키 사용")
+                await page.keyboard.press("Enter")
+
+            # 제출 후 대기
+            await page.wait_for_timeout(5000)
+            logger.info(f"제출 후 URL: {page.url}")
+            await page.screenshot(path=f"{self.data_dir}/debug_after_continue.png")
+
+            # 에러 메시지 확인
+            try:
+                page_text = await page.evaluate("() => document.body.innerText.substring(0, 1500)")
+                error_keywords = ['incorrect', 'invalid', 'wrong password', 'too many',
+                                  'locked', 'suspended', 'try again later']
+                for keyword in error_keywords:
+                    if keyword.lower() in page_text.lower():
+                        logger.error(f"로그인 에러: '{keyword}'")
+                        break
+                logger.info(f"제출 후 화면: {page_text[:400]}")
+            except Exception:
+                pass
+
+            # 캡차 + 인증 코드 반복 처리 (캡차가 여러 번 나올 수 있음)
+            for captcha_round in range(3):
+                # 캡차 처리 (슬라이더 퍼즐 캡차가 나타날 수 있음)
                 captcha_passed = await self._handle_captcha()
 
                 if not captcha_passed:
@@ -533,13 +514,17 @@ class TikTokShopScraper:
                         self._notify_captcha_failure()
                         return False
 
+                # 캡차 후 페이지 전환 대기
                 await page.wait_for_timeout(3000)
                 current_url = page.url
                 logger.info(f"캡차 라운드 {captcha_round + 1} 완료. URL: {current_url}")
 
+                # 캡차 후 실제로 페이지가 전환되었는지 확인
                 if "/account/login" not in current_url:
                     break
 
+                # 여전히 로그인 페이지 → 캡차가 실제로 안 풀린 것
+                # 페이지에 캡차가 남아있는지 확인
                 has_captcha_text = False
                 try:
                     body = await page.evaluate("() => document.body.innerText")
@@ -552,8 +537,10 @@ class TikTokShopScraper:
                     await page.wait_for_timeout(2000)
                     continue
 
+                # 인증 코드 확인
                 if await self._needs_verification():
                     break
+                # 짧은 대기 후 다시 확인
                 await page.wait_for_timeout(3000)
 
             logger.info(f"캡차 처리 후 최종 URL: {page.url}")
@@ -566,11 +553,12 @@ class TikTokShopScraper:
                     logger.error("인증 코드 타임아웃")
                     return False
 
-            # 로그인 완료 대기
+            # 로그인 완료 대기 (SSO 리다이렉트 포함)
             for i in range(10):
                 await page.wait_for_timeout(3000)
                 current_url = page.url
 
+                # register 리다이렉트 감지 → Seller Center 메인으로 재이동
                 if "/account/register" in current_url:
                     logger.info("register 리다이렉트 감지 - Seller Center 메인으로 재이동")
                     await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
@@ -584,6 +572,7 @@ class TikTokShopScraper:
                     logger.info("로그인 성공!")
                     return True
 
+                # 여전히 로그인 페이지에서 인증 코드가 새로 나타났을 수 있음
                 if "/account/login" in current_url and await self._needs_verification():
                     logger.info("로그인 대기 중 인증 코드 감지")
                     verified = await self._wait_for_verification(timeout=300)
@@ -594,82 +583,100 @@ class TikTokShopScraper:
 
             # Rating 페이지로 직접 이동 시도
             await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(8000)
+            await page.wait_for_timeout(8000)  # 충분히 대기
 
             if await self._is_logged_in():
                 logger.info("로그인 성공! (Rating 페이지 이동 후)")
                 return True
 
-            logger.warning(f"Seller Center 직접 로그인 실패. URL: {page.url}")
-            await page.screenshot(path=f"{self.data_dir}/debug_seller_login_failed.png", full_page=True)
+            logger.error(f"로그인 후에도 인증 확인 실패. URL: {page.url}")
+            await page.screenshot(path=f"{self.data_dir}/debug_login_failed.png", full_page=True)
             return False
 
         except Exception as e:
-            logger.error(f"Seller Center 로그인 오류: {e}")
+            logger.error(f"로그인 오류: {e}")
             return False
 
     async def _react_safe_input(self, element, text: str, force_events: bool = False):
         """
         React controlled component에 안전하게 텍스트 입력.
-        SSO iframe 내부의 React input도 지원 (fill → type → JS 순서).
+
+        전략 (순서대로 시도):
+        1. fill() - Playwright 기본 (대부분의 경우 동작)
+        2. triple-click + keyboard.type() - 실제 키보드 이벤트
+        3. Native setter + React 이벤트 디스패치 - 최후 수단
         """
         page = self._page
 
-        # 방법 1: fill() (CDP 레벨에서 작동, iframe 호환성 최고)
-        try:
-            await element.fill(text)
-            await page.wait_for_timeout(200)
-            value = await element.evaluate("el => el.value")
-            if value == text:
-                return
-            logger.debug(f"fill() 후 값 불일치: '{value}' vs '{text}'")
-        except Exception as e:
-            logger.debug(f"fill() 실패: {e}")
+        if not force_events:
+            # 방법 1: fill() 시도 (가장 신뢰할 수 있는 방법)
+            try:
+                await element.fill(text)
+                await page.wait_for_timeout(200)
+                value = await element.evaluate("el => el.value")
+                if value == text:
+                    return
+                logger.info(f"fill() 후 값 불일치: '{value}' (keyboard.type 시도)")
+            except Exception as e:
+                logger.info(f"fill() 실패: {e}")
 
-        # 방법 2: click + type() (키보드 이벤트)
-        try:
-            await element.click()
-            await page.wait_for_timeout(200)
-            await page.keyboard.press("Control+a")
-            await page.keyboard.press("Delete")
+            # 방법 2: click + select all + keyboard.type()
+            await element.click(click_count=3)  # triple-click으로 전체 선택
             await page.wait_for_timeout(100)
-            await element.type(text, delay=50)
+            await page.keyboard.type(text, delay=30)
             await page.wait_for_timeout(200)
+
             value = await element.evaluate("el => el.value")
             if value == text:
                 return
-            logger.debug(f"type() 후 값 불일치: '{value}' vs '{text}'")
-        except Exception as e:
-            logger.debug(f"type() 실패: {e}")
+            logger.info(f"keyboard.type() 후 값 불일치: '{value}' (native setter 시도)")
 
-        # 방법 3: JS로 React 이벤트 시스템 직접 트리거 (최종 폴백)
-        try:
-            await element.evaluate("""
-                (el, text) => {
-                    el.focus();
+        # 방법 3: Native setter + 이벤트 디스패치 (React 강제 업데이트)
+        await element.evaluate("""
+            (el, text) => {
+                // React 내부 상태 키를 찾아서 직접 업데이트
+                const reactPropsKey = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+                if (reactPropsKey && el[reactPropsKey] && el[reactPropsKey].onChange) {
+                    // React onChange 핸들러 직접 호출
                     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value'
                     ).set;
                     nativeInputValueSetter.call(el, text);
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                    el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
-                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                } else {
+                    // React props를 못 찾으면 일반 setter 사용
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    nativeInputValueSetter.call(el, text);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    // React 16+ 호환 이벤트도 발생
+                    const inputEvent = new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: false,
+                        inputType: 'insertText',
+                        data: text,
+                    });
+                    el.dispatchEvent(inputEvent);
                 }
-            """, text)
-            await page.wait_for_timeout(300)
-        except Exception as e:
-            logger.warning(f"JS 강제 입력도 실패: {e}")
+            }
+        """, text)
+        await page.wait_for_timeout(300)
+
+        value = await element.evaluate("el => el.value")
+        logger.info(f"native setter 후 값: '{value}' (expected: '{text[:20]}...')")
 
     async def _click_login_button(self) -> bool:
         """로그인 버튼 클릭 (다양한 방법 시도)"""
         page = self._page
 
         # 방법 1: 셀렉터로 직접 클릭
+        # TikTok Seller Center: "Continue"가 실제 제출 버튼
         for selector in [
-            'button[type="submit"]',
-            'button:has-text("Log in")',
             'button:has-text("Continue")',
+            'button[type="submit"]',
         ]:
             btn = await page.query_selector(selector)
             if btn and await btn.is_visible():
@@ -694,524 +701,6 @@ class TikTokShopScraper:
             )
         except Exception as e:
             logger.warning(f"Slack 알림 전송 실패: {e}")
-
-    async def _do_tiktok_com_login(self) -> bool:
-        """www.tiktok.com에서 선행 로그인 후 Seller Center로 이동 (SSO iframe 우회)"""
-        page = self._page
-        TIKTOK_LOGIN_URL = "https://www.tiktok.com/login/phone-or-email/email"
-
-        try:
-            logger.info(f"www.tiktok.com 로그인 페이지 이동: {TIKTOK_LOGIN_URL}")
-            await page.goto(TIKTOK_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-
-            # 쿠키 배너 닫기
-            for cookie_sel in [
-                'button:has-text("Accept all")',
-                'button:has-text("Accept")',
-                'button:has-text("Decline optional cookies")',
-            ]:
-                cookie_btn = await page.query_selector(cookie_sel)
-                if cookie_btn and await cookie_btn.is_visible():
-                    await cookie_btn.click()
-                    logger.info(f"쿠키 배너 닫기: {cookie_sel}")
-                    await page.wait_for_timeout(1000)
-                    break
-
-            # 현재 URL 확인 (리다이렉트 될 수 있음)
-            current_url = page.url
-            logger.info(f"로그인 페이지 URL: {current_url}")
-
-            # 이메일 입력 필드 찾기
-            email_input = None
-            for sel in [
-                'input[name="username"]',
-                'input[placeholder*="email" i]',
-                'input[placeholder*="Email" i]',
-                'input[type="text"]',
-            ]:
-                email_input = await page.query_selector(sel)
-                if email_input and await email_input.is_visible():
-                    logger.info(f"이메일 필드 발견: {sel}")
-                    break
-                email_input = None
-
-            if not email_input:
-                logger.error("www.tiktok.com 이메일 필드를 찾을 수 없음")
-                await page.screenshot(path=f"{self.data_dir}/debug_tiktok_login_page.png", full_page=True)
-                return False
-
-            # 이메일 입력 (타이핑 방식으로 봇 탐지 우회)
-            await email_input.click()
-            await page.wait_for_timeout(300)
-            await email_input.fill("")
-            for char in self.email:
-                await page.keyboard.press(char)
-                await page.wait_for_timeout(random.randint(30, 80))
-            logger.info(f"이메일 입력 완료: {self.email}")
-
-            await page.wait_for_timeout(500)
-
-            # 비밀번호 입력 필드 찾기
-            password_input = await page.query_selector('input[type="password"]')
-            if not password_input:
-                logger.error("www.tiktok.com 비밀번호 필드를 찾을 수 없음")
-                return False
-
-            # 비밀번호 입력 (타이핑 방식)
-            await password_input.click()
-            await page.wait_for_timeout(300)
-            for char in self.password:
-                await page.keyboard.press(char)
-                await page.wait_for_timeout(random.randint(30, 80))
-            logger.info("비밀번호 입력 완료")
-
-            await page.wait_for_timeout(1000)
-
-            # Log in 버튼 클릭
-            login_btn = None
-            for btn_sel in [
-                'button[data-e2e="login-button"]',
-                'button[type="submit"]',
-                'button:has-text("Log in")',
-            ]:
-                btn = await page.query_selector(btn_sel)
-                if btn and await btn.is_visible():
-                    # "Log in with" 같은 소셜 로그인 버튼 제외
-                    btn_text = await btn.text_content()
-                    if btn_text and "with" not in btn_text.lower():
-                        login_btn = btn
-                        logger.info(f"로그인 버튼 발견: {btn_sel} (텍스트: {btn_text})")
-                        break
-
-            if not login_btn:
-                # 폼 제출로 폴백
-                logger.info("로그인 버튼 미발견 - Enter 키로 제출")
-                await page.keyboard.press("Enter")
-            else:
-                await login_btn.click()
-                logger.info("로그인 버튼 클릭")
-
-            await page.wait_for_timeout(5000)
-            logger.info(f"로그인 버튼 클릭 후 URL: {page.url}")
-
-            # 에러 메시지 확인 (rate limit, 잘못된 자격증명 등)
-            error_msg = await self._check_login_error(page)
-            if error_msg:
-                logger.error(f"www.tiktok.com 로그인 에러: {error_msg}")
-                await page.screenshot(path=f"{self.data_dir}/debug_tiktok_com_error.png", full_page=True)
-                # Rate limit 시 쿠키 보존 (삭제하면 다음 실행에서 세션 재사용 불가 → 악순환)
-                if "Rate limit" in error_msg:
-                    logger.warning("Rate limit 감지 - 쿠키 보존 (다음 실행에서 세션 재사용 시도)")
-                return False
-
-            # 캡차 처리 (www.tiktok.com에서도 슬라이더 캡차 가능)
-            for captcha_round in range(2):  # rate limit 방지: 최대 2라운드
-                captcha_passed = await self._handle_captcha()
-                if not captcha_passed:
-                    if not self.headless:
-                        logger.info("캡차를 수동으로 풀어주세요 (최대 60초 대기)")
-                        for _ in range(12):
-                            await page.wait_for_timeout(5000)
-                            url = page.url
-                            if "/login" not in url or await self._needs_verification():
-                                break
-                    else:
-                        logger.warning("Headless 모드에서 캡차 자동 풀기 실패")
-                        break
-
-                await page.wait_for_timeout(3000)
-                current_url = page.url
-                logger.info(f"캡차 라운드 {captcha_round + 1} 완료. URL: {current_url}")
-
-                # 에러 메시지 재확인
-                error_msg = await self._check_login_error(page)
-                if error_msg:
-                    logger.error(f"캡차 후 로그인 에러: {error_msg}")
-                    return False
-
-                # 로그인 페이지를 벗어났으면 성공
-                if "/login" not in current_url:
-                    break
-
-                # 인증 코드 필요 확인
-                if await self._needs_verification():
-                    break
-
-            # 인증 코드 처리
-            if await self._needs_verification():
-                logger.info("이메일 인증 코드 필요 (www.tiktok.com) - 대기 중...")
-                verified = await self._wait_for_verification(timeout=300)
-                if not verified:
-                    logger.error("인증 코드 타임아웃")
-                    return False
-
-            # 로그인 성공 확인: 세션 쿠키 체크
-            await page.wait_for_timeout(3000)
-            cookies = await self._context.cookies()
-            SESSION_COOKIE_NAMES = ("sid_tt", "sessionid", "sessionid_ss", "sid_guard",
-                                    "sid_tt_tiktokseller", "sessionid_tiktokseller",
-                                    "sessionid_ss_tiktokseller", "sid_guard_tiktokseller")
-            session_cookies = {c["name"]: c["value"] for c in cookies
-                             if c["name"] in SESSION_COOKIE_NAMES}
-            logger.info(f"세션 쿠키 확인: {list(session_cookies.keys())}")
-
-            has_session = bool(session_cookies.get("sessionid") or session_cookies.get("sid_tt")
-                             or session_cookies.get("sessionid_tiktokseller") or session_cookies.get("sid_tt_tiktokseller"))
-
-            if not has_session:
-                # 추가 대기 (로그인 처리 중일 수 있음)
-                for _ in range(6):
-                    await page.wait_for_timeout(5000)
-                    cookies = await self._context.cookies()
-                    session_cookies = {c["name"]: c["value"] for c in cookies
-                                     if c["name"] in SESSION_COOKIE_NAMES}
-                    has_session = bool(session_cookies.get("sessionid") or session_cookies.get("sid_tt")
-                                     or session_cookies.get("sessionid_tiktokseller") or session_cookies.get("sid_tt_tiktokseller"))
-                    if has_session:
-                        break
-                    current_url = page.url
-                    logger.info(f"  세션 대기 중... URL: {current_url[:80]}")
-
-            if not has_session:
-                logger.error("www.tiktok.com 로그인 실패 - 세션 쿠키 없음")
-                await page.screenshot(path=f"{self.data_dir}/debug_tiktok_com_login_failed.png", full_page=True)
-                return False
-
-            logger.info("www.tiktok.com 로그인 성공! 세션 쿠키 획득됨")
-
-            # Seller Center로 이동 (SSO 자동 인증 기대)
-            logger.info("Seller Center Rating 페이지로 이동...")
-            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)
-
-            # SSO 리다이렉트 완료 대기
-            for i in range(8):
-                current_url = page.url
-                if await self._is_logged_in():
-                    logger.info("Seller Center 로그인 성공! (www.tiktok.com SSO)")
-                    return True
-
-                if "/account/register" in current_url:
-                    logger.info("register 리다이렉트 - Seller Center 메인으로 재이동")
-                    await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(5000)
-                    if await self._is_logged_in():
-                        logger.info("Seller Center 로그인 성공! (register 우회)")
-                        return True
-
-                await page.wait_for_timeout(3000)
-                logger.info(f"  SSO 대기 중... URL: {current_url[:80]}")
-
-            # 마지막 시도: Rating 페이지 직접 이동
-            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(8000)
-
-            if await self._is_logged_in():
-                logger.info("Seller Center 로그인 성공! (최종 시도)")
-                return True
-
-            logger.error(f"www.tiktok.com 로그인 후 Seller Center 접근 실패. URL: {page.url}")
-            await page.screenshot(path=f"{self.data_dir}/debug_tiktok_sso_failed.png", full_page=True)
-            return False
-
-        except Exception as e:
-            logger.error(f"www.tiktok.com 로그인 오류: {e}")
-            return False
-
-    # =========================================================================
-    # Proxy Login (IP 차단/Rate Limit 우회)
-    # =========================================================================
-
-    async def _login_with_proxy(self) -> bool:
-        """무료 프록시를 사용하여 별도 브라우저에서 로그인 후 쿠키 추출.
-
-        메인 브라우저와 별개로 프록시 브라우저를 생성하여 로그인만 수행.
-        성공 시 쿠키를 JSON 파일로 저장하고, 메인 브라우저에서 로드.
-        """
-        import json
-
-        try:
-            from utils.free_proxy import get_working_proxies
-        except ImportError:
-            logger.error("free_proxy 모듈 임포트 실패")
-            return False
-
-        proxies = await get_working_proxies(count=10)
-        if not proxies:
-            logger.error("사용 가능한 프록시 없음")
-            return False
-
-        for i, proxy_info in enumerate(proxies, 1):
-            proxy_str = proxy_info["proxy"]
-            protocol = proxy_info.get("protocol", "http")
-            proxy_url = f"{protocol}://{proxy_str}"
-            logger.info(f"프록시 로그인 시도 {i}/{len(proxies)}: {proxy_str} (IP: {proxy_info.get('ip', '?')})")
-
-            proxy_browser = None
-            try:
-                # 프록시 브라우저 생성 (임시, persistent 아님)
-                use_headless = True
-                display = os.environ.get("DISPLAY", "")
-                if display:
-                    use_headless = False
-
-                proxy_browser = await self._playwright.chromium.launch(
-                    headless=use_headless,
-                    proxy={"server": proxy_url},
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-features=IsolateOrigins,site-per-process",
-                        "--disable-site-isolation-trials",
-                        "--disable-web-security",
-                    ],
-                )
-                context = await proxy_browser.new_context(
-                    viewport={"width": 1440, "height": 900},
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    bypass_csp=True,
-                )
-                page = await context.new_page()
-
-                # Seller Center 접속 → 로그인 페이지로 리다이렉트 예상
-                logger.info(f"  프록시로 Seller Center 접속 중...")
-                await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(5000)
-
-                current_url = page.url
-                if "/account/login" not in current_url and "/account/register" not in current_url:
-                    # 이미 로그인되어 있거나 다른 페이지
-                    if "homepage" in current_url or "product" in current_url:
-                        logger.info(f"  프록시 브라우저 이미 인증됨 (비정상)")
-
-                # SSO 로그인 시도
-                login_success = await self._proxy_do_login(page, context)
-
-                if login_success:
-                    # 쿠키 추출 및 저장
-                    cookies = await context.cookies()
-                    tiktok_cookies = [c for c in cookies if "tiktok" in c.get("domain", "")]
-
-                    SESSION_NAMES = ("sid_tt_tiktokseller", "sessionid_tiktokseller",
-                                    "sid_tt", "sessionid")
-                    has_session = any(c["name"] in SESSION_NAMES for c in tiktok_cookies)
-
-                    if has_session:
-                        cookie_file = os.path.join(self.data_dir, "tiktok_cookies.json")
-                        with open(cookie_file, "w") as f:
-                            json.dump(tiktok_cookies, f, indent=2)
-                        logger.info(f"프록시 로그인 성공! {len(tiktok_cookies)}개 쿠키 저장")
-                        await proxy_browser.close()
-                        return True
-                    else:
-                        logger.warning(f"  프록시 로그인 후 세션 쿠키 없음")
-
-                await proxy_browser.close()
-
-            except Exception as e:
-                logger.warning(f"  프록시 {proxy_str} 실패: {e}")
-                if proxy_browser:
-                    try:
-                        await proxy_browser.close()
-                    except Exception:
-                        pass
-
-        logger.error(f"모든 프록시 로그인 실패 ({len(proxies)}개 시도)")
-        return False
-
-    async def _proxy_do_login(self, page, context) -> bool:
-        """프록시 브라우저에서 Seller Center 로그인 수행."""
-        try:
-            current_url = page.url
-
-            # 로그인 페이지로 이동
-            if "/account/login" not in current_url:
-                await page.goto(self.SELLER_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(5000)
-
-            # Log in 탭 클릭 시도
-            try:
-                login_tabs = await page.query_selector_all('div:has-text("Log in")')
-                for tab in login_tabs[:1]:
-                    if await tab.is_visible():
-                        await tab.click()
-                        await page.wait_for_timeout(2000)
-                        break
-            except Exception:
-                pass
-
-            # 이메일 입력
-            email_selectors = [
-                'input[name="email"]', 'input[type="email"]',
-                'input[placeholder*="email" i]', 'input[name="username"]',
-            ]
-            email_input = None
-            for sel in email_selectors:
-                email_input = await page.query_selector(sel)
-                if email_input:
-                    break
-
-            if not email_input:
-                # iframe 내부 검색
-                for frame in page.frames:
-                    for sel in email_selectors:
-                        email_input = await frame.query_selector(sel)
-                        if email_input:
-                            page = frame  # iframe으로 전환
-                            break
-                    if email_input:
-                        break
-
-            if not email_input:
-                logger.warning("  이메일 입력 필드를 찾을 수 없음")
-                return False
-
-            await email_input.fill(self.email)
-            await page.wait_for_timeout(500)
-            # fill() 후 값 검증 → React 이벤트 미전파 시 keyboard 타이핑 폴백
-            email_value = await email_input.evaluate("el => el.value")
-            if not email_value:
-                logger.info("  fill() 미반영 → keyboard 타이핑으로 재입력")
-                await email_input.click()
-                await email_input.evaluate("el => { el.value = ''; }")
-                for char in self.email:
-                    await page.keyboard.press(char)
-                    await page.wait_for_timeout(random.randint(30, 60))
-            logger.info(f"  이메일 입력 완료")
-
-            # 비밀번호 입력
-            pw_input = await page.query_selector('input[type="password"]')
-            if not pw_input:
-                logger.warning("  비밀번호 입력 필드를 찾을 수 없음")
-                return False
-
-            await pw_input.fill(self.password)
-            await page.wait_for_timeout(500)
-            # fill() 후 값 검증 → keyboard 타이핑 폴백
-            pw_value = await pw_input.evaluate("el => el.value")
-            if not pw_value:
-                logger.info("  fill() 미반영 → keyboard 타이핑으로 재입력")
-                await pw_input.click()
-                await pw_input.evaluate("el => { el.value = ''; }")
-                for char in self.password:
-                    await page.keyboard.press(char)
-                    await page.wait_for_timeout(random.randint(30, 60))
-            logger.info(f"  비밀번호 입력 완료")
-
-            # 로그인 버튼 클릭
-            login_btn = await page.query_selector(
-                'button:has-text("Log in"), button:has-text("로그인"), button[type="submit"]'
-            )
-            if login_btn:
-                await login_btn.click()
-                logger.info("  로그인 버튼 클릭")
-            else:
-                logger.warning("  로그인 버튼을 찾을 수 없음")
-                return False
-
-            # 로그인 결과 대기 (최대 60초)
-            for wait in range(12):
-                await page.wait_for_timeout(5000)
-                try:
-                    url = page.url if hasattr(page, 'url') else ""
-                except Exception:
-                    url = ""
-
-                # 성공 패턴
-                if any(p in url for p in ("homepage", "product/rating", "compass")):
-                    logger.info(f"  프록시 로그인 성공! URL: {url[:80]}")
-                    return True
-
-                # 실패 패턴 - rate limit
-                try:
-                    body = await page.evaluate("() => document.body.innerText.substring(0, 500)")
-                    if "Rate limit" in body or "Maximum number" in body:
-                        logger.warning(f"  프록시 IP도 Rate limit 감지")
-                        return False
-                    if "사용자가 존재하지 않음" in body or "user does not exist" in body.lower():
-                        logger.warning(f"  사용자 존재하지 않음 에러")
-                        return False
-                except Exception:
-                    pass
-
-                # 캡차 감지
-                try:
-                    captcha = await page.query_selector(
-                        '#captcha_container, .captcha_verify_container, '
-                        '.cap-rounded-full.cap-bg-UISheetGrouped3, '
-                        '[class*="captcha"], [id*="captcha"]'
-                    )
-                    if captcha:
-                        logger.info("  캡차 감지 → 자동 풀기 시도...")
-                        # 캡차 풀기는 메인 로직의 captcha_solver 재활용
-                        from utils.captcha_solver import TikTokCaptchaSolver
-                        solver = TikTokCaptchaSolver(page)
-                        solved = await solver.solve()
-                        if solved:
-                            logger.info("  캡차 해결!")
-                            await page.wait_for_timeout(3000)
-                            continue
-                except Exception:
-                    pass
-
-            logger.warning("  프록시 로그인 타임아웃")
-            return False
-
-        except Exception as e:
-            logger.error(f"  프록시 로그인 오류: {e}")
-            return False
-
-    async def _clear_tiktok_cookies(self):
-        """TikTok 관련 쿠키를 모두 삭제 (rate limit 상태 초기화)"""
-        try:
-            if self._context:
-                cookies = await self._context.cookies()
-                tiktok_cookies = [c for c in cookies
-                                 if "tiktok" in c.get("domain", "").lower()]
-                if tiktok_cookies:
-                    await self._context.clear_cookies()
-                    logger.info(f"TikTok 쿠키 {len(tiktok_cookies)}개 삭제 (rate limit 초기화)")
-        except Exception as e:
-            logger.debug(f"쿠키 삭제 중 오류 (무시): {e}")
-
-    @staticmethod
-    async def _check_login_error(page) -> Optional[str]:
-        """로그인 페이지에서 에러 메시지를 감지. 에러가 있으면 메시지 반환, 없으면 None."""
-        try:
-            body_text = await page.evaluate("() => document.body.innerText.substring(0, 3000)")
-            # Rate limit
-            rate_limit_patterns = [
-                "Maximum number of attempts reached",
-                "Too many attempts",
-                "try again later",
-                "rate limit",
-                "temporarily locked",
-                "temporarily blocked",
-                "account is locked",
-            ]
-            for pattern in rate_limit_patterns:
-                if pattern.lower() in body_text.lower():
-                    return f"Rate limit: {pattern}"
-
-            # 잘못된 자격증명
-            credential_patterns = [
-                "Incorrect password",
-                "incorrect password",
-                "Wrong password",
-                "account doesn't exist",
-                "Account not found",
-                "Invalid email",
-            ]
-            for pattern in credential_patterns:
-                if pattern in body_text:
-                    return f"Credentials: {pattern}"
-
-        except Exception:
-            pass
-
-        return None
 
     async def _handle_captcha(self) -> bool:
         """캡차가 있으면 자동으로 풀기. 캡차가 남아있으면 False 반환."""
@@ -1352,10 +841,8 @@ class TikTokShopScraper:
             await page.wait_for_timeout(5000)
             return await self._is_logged_in()
 
-        # 2. Gmail API/IMAP으로 인증 코드 자동 읽기
-        has_gmail = (self.gmail_service_account_file and self.gmail_target_email) or \
-                    (self.gmail_imap_email and self.gmail_imap_app_password)
-        if has_gmail:
+        # 2. Gmail IMAP으로 인증 코드 자동 읽기
+        if self.gmail_imap_email and self.gmail_imap_app_password:
             code = await self._get_code_from_gmail()
             if code:
                 logger.info(f"Gmail IMAP에서 인증 코드 획득: {code}")
@@ -1386,24 +873,21 @@ class TikTokShopScraper:
         return False
 
     async def _get_code_from_gmail(self) -> Optional[str]:
-        """Gmail API 또는 IMAP을 사용하여 TikTok 인증 코드를 읽어옵니다."""
+        """Gmail IMAP을 사용하여 TikTok 인증 코드를 읽어옵니다."""
         try:
             from utils.gmail_code_reader import GmailVerificationCodeReader
 
             reader = GmailVerificationCodeReader(
-                service_account_file=self.gmail_service_account_file,
-                target_email=self.gmail_target_email,
                 imap_email=self.gmail_imap_email,
                 imap_app_password=self.gmail_imap_app_password,
             )
 
-            method = "Gmail API" if self.gmail_service_account_file else "IMAP"
-            logger.info(f"{method}로 인증 코드 이메일 폴링 시작...")
+            logger.info("Gmail IMAP으로 인증 코드 이메일 폴링 시작...")
             code = await reader.async_wait_for_verification_code(timeout=120, poll_interval=5)
             return code
 
         except Exception as e:
-            logger.error(f"Gmail 인증 코드 읽기 실패: {e}")
+            logger.error(f"Gmail IMAP 인증 코드 읽기 실패: {e}")
             return None
 
     async def _input_verification_code(self, code: str):
@@ -1558,32 +1042,6 @@ class TikTokShopScraper:
                 reviews = await self._parse_reviews_from_page()
 
                 if not reviews:
-                    if page_num == 1:
-                        # 첫 페이지에서 리뷰 0건이면 디버깅 정보 출력
-                        debug_info = await page.evaluate("""
-                            () => {
-                                const body = document.body;
-                                const allClasses = Array.from(document.querySelectorAll('[class]'))
-                                    .map(el => el.className)
-                                    .filter(c => typeof c === 'string')
-                                    .filter(c => c.toLowerCase().includes('rating') ||
-                                                 c.toLowerCase().includes('review') ||
-                                                 c.toLowerCase().includes('list') ||
-                                                 c.toLowerCase().includes('star') ||
-                                                 c.toLowerCase().includes('item'))
-                                    .slice(0, 50);
-                                return {
-                                    url: window.location.href,
-                                    title: document.title,
-                                    bodyLength: body.innerText.length,
-                                    relevantClasses: allClasses,
-                                    bodyPreview: body.innerText.substring(0, 500),
-                                };
-                            }
-                        """)
-                        logger.warning(f"[Page 1] 리뷰 0건 - 디버깅 정보: {json.dumps(debug_info, ensure_ascii=False, indent=2)}")
-                        # 스크린샷 저장
-                        await page.screenshot(path=f"{self.data_dir}/debug_no_reviews.png", full_page=True)
                     logger.info(f"[Page {page_num}] 리뷰를 찾을 수 없음. 수집 종료.")
                     break
 
@@ -1651,238 +1109,129 @@ class TikTokShopScraper:
                 await page.wait_for_timeout(3000)
 
         logger.info(f"리뷰 수집 완료: 총 {len(all_reviews)}개")
-        await self._save_cookies_to_file()
         return all_reviews
 
     async def _parse_reviews_from_page(self) -> list[dict]:
-        """현재 페이지의 리뷰를 JavaScript로 파싱 (다단계 폴백 셀렉터)"""
+        """현재 페이지의 리뷰를 JavaScript로 파싱"""
         page = self._page
 
-        # 디버깅: 첫 페이지 HTML 저장 (셀렉터 분석용)
+        # DOM 디버깅: 리뷰 관련 클래스 확인 및 HTML 저장
+        debug_info = await page.evaluate("""
+            () => {
+                const allEls = document.querySelectorAll('*');
+                const classSet = new Set();
+                for (const el of allEls) {
+                    const cls = el.className;
+                    if (typeof cls === 'string') {
+                        cls.split(/\\s+/).forEach(c => {
+                            const lower = c.toLowerCase();
+                            if (lower.includes('rating') || lower.includes('review') ||
+                                lower.includes('star') || lower.includes('comment') ||
+                                lower.includes('feedback') || lower.includes('list') ||
+                                lower.includes('table') || lower.includes('row') ||
+                                lower.includes('card') || lower.includes('item')) {
+                                classSet.add(c);
+                            }
+                        });
+                    }
+                }
+                // ratingListItem 셀렉터 직접 테스트
+                const ratingItems = document.querySelectorAll('[class*="ratingListItem"]');
+                // 테이블 구조 확인
+                const tables = document.querySelectorAll('table');
+                const arcoTables = document.querySelectorAll('[class*="arco-table"]');
+                return {
+                    url: window.location.href,
+                    totalElements: allEls.length,
+                    matchingClasses: Array.from(classSet).sort().slice(0, 80),
+                    ratingListItemCount: ratingItems.length,
+                    tableCount: tables.length,
+                    arcoTableCount: arcoTables.length,
+                    bodyTextPreview: document.body.innerText.substring(0, 2000)
+                };
+            }
+        """)
+        logger.info(f"[DOM 디버깅] URL: {debug_info.get('url', 'N/A')}")
+        logger.info(f"[DOM 디버깅] 총 요소: {debug_info.get('totalElements', 0)}, "
+                     f"ratingListItem: {debug_info.get('ratingListItemCount', 0)}, "
+                     f"table: {debug_info.get('tableCount', 0)}, "
+                     f"arco-table: {debug_info.get('arcoTableCount', 0)}")
+        logger.info(f"[DOM 디버깅] 관련 클래스: {debug_info.get('matchingClasses', [])}")
+        body_preview = debug_info.get('bodyTextPreview', '')[:500]
+        logger.info(f"[DOM 디버깅] Body 미리보기: {body_preview}")
+
+        # HTML 파일 저장 (최초 1회)
         try:
             html_path = os.path.join(self.data_dir, "rating_page.html")
             if not os.path.exists(html_path):
-                html = await page.content()
+                full_html = await page.evaluate("() => document.documentElement.outerHTML")
                 with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(html)
-                logger.info(f"Rating 페이지 HTML 저장: {html_path}")
+                    f.write(full_html)
+                logger.info(f"[DOM 디버깅] HTML 저장: {html_path} ({len(full_html)} chars)")
+            # 스크린샷도 저장
+            ss_path = os.path.join(self.data_dir, "debug_rating_current.png")
+            await page.screenshot(path=ss_path, full_page=True)
         except Exception as e:
-            logger.debug(f"HTML 저장 실패 (무시): {e}")
+            logger.debug(f"디버깅 파일 저장 실패: {e}")
 
         reviews = await page.evaluate("""
             () => {
-                // 다단계 리뷰 컨테이너 탐색
-                // CSS Modules는 클래스명에 해시를 추가하므로 부분 매칭 사용
-                const selectors = [
-                    '[class*="ratingListItem"]',
-                    '[class*="RatingListItem"]',
-                    '[class*="rating-list-item"]',
-                    '[class*="reviewItem"]',
-                    '[class*="ReviewItem"]',
-                    '[class*="review-item"]',
-                    '[class*="reviewCard"]',
-                    '[class*="ReviewCard"]',
-                ];
-
-                let items = [];
-                for (const sel of selectors) {
-                    items = document.querySelectorAll(sel);
-                    if (items.length > 0) break;
-                }
-
-                // 폴백: 별점(SVG star)을 포함한 반복 요소 탐색
-                if (items.length === 0) {
-                    // 테이블 행 기반 (Arco Design Table)
-                    const tableRows = document.querySelectorAll('.arco-table-tr, tr[class*="Row"]');
-                    if (tableRows.length > 0) {
-                        items = tableRows;
-                    }
-                }
-
-                // 최종 폴백: 별점 SVG가 포함된 상위 컨테이너 역추적
-                if (items.length === 0) {
-                    const starEls = document.querySelectorAll('[class*="star"], [class*="Star"], svg[class*="star"]');
-                    const containers = new Set();
-                    starEls.forEach(el => {
-                        // 별점에서 3~5단계 상위로 올라가서 리뷰 컨테이너 탐색
-                        let parent = el;
-                        for (let i = 0; i < 5 && parent; i++) {
-                            parent = parent.parentElement;
-                            if (parent && parent.children.length >= 3) {
-                                // 텍스트 콘텐츠가 50자 이상이고 날짜 패턴 포함
-                                const text = parent.textContent || '';
-                                if (text.length > 50 && /\\d{4}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/.test(text)) {
-                                    containers.add(parent);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    items = Array.from(containers);
-                }
-
+                const items = document.querySelectorAll('[class*="ratingListItem"]');
                 const results = [];
-
-                // 발견된 셀렉터 정보 (디버깅용)
-                if (items.length === 0) {
-                    // DOM 구조 스냅샷 저장 (디버깅)
-                    const bodyClasses = Array.from(document.querySelectorAll('[class]'))
-                        .map(el => el.className)
-                        .filter(c => typeof c === 'string' && (
-                            c.toLowerCase().includes('rating') ||
-                            c.toLowerCase().includes('review') ||
-                            c.toLowerCase().includes('star') ||
-                            c.toLowerCase().includes('list')
-                        ))
-                        .slice(0, 30);
-                    console.log('리뷰 관련 클래스:', JSON.stringify(bodyClasses));
-                    return results;
-                }
 
                 items.forEach(item => {
                     try {
-                        // 별점: 다단계 탐색
-                        let activeStars = 0;
-                        // 방법 1: activeStar 클래스
-                        const starContainer = item.querySelector('[class*="ratingStar"], [class*="RatingStar"], [class*="star-container"], [class*="StarContainer"]');
-                        if (starContainer) {
-                            activeStars = starContainer.querySelectorAll('[class*="activeStar"], [class*="ActiveStar"], [class*="active-star"], [class*="filled"], [class*="Filled"]').length;
-                        }
-                        // 방법 2: SVG fill 색상으로 별점 계산
-                        if (activeStars === 0) {
-                            const svgs = item.querySelectorAll('svg');
-                            svgs.forEach(svg => {
-                                const fill = svg.getAttribute('fill') || '';
-                                const cls = svg.className?.baseVal || svg.className || '';
-                                if (fill === '#FFC107' || fill === '#FFB400' || fill.includes('gold') ||
-                                    cls.includes('active') || cls.includes('Active') || cls.includes('filled')) {
-                                    activeStars++;
-                                }
-                            });
-                        }
-                        // 방법 3: aria-label에서 별점 추출 (예: "4 stars")
-                        if (activeStars === 0) {
-                            const ratingEl = item.querySelector('[aria-label*="star" i]');
-                            if (ratingEl) {
-                                const match = ratingEl.getAttribute('aria-label').match(/(\\d)/);
-                                if (match) activeStars = parseInt(match[1]);
-                            }
-                        }
+                        // 별점: activeStar SVG 개수
+                        const starContainer = item.querySelector('[class*="ratingStar"]');
+                        const activeStars = starContainer
+                            ? starContainer.querySelectorAll('[class*="activeStar"]').length
+                            : 0;
 
-                        // 날짜: 다단계 탐색
-                        let dateText = '';
-                        const dateEl = item.querySelector(
-                            '[class*="reviewTime"], [class*="ReviewTime"], [class*="review-time"], ' +
-                            '[class*="date"], [class*="Date"], [class*="time"], [class*="Time"]'
-                        );
-                        if (dateEl) {
-                            dateText = dateEl.textContent.trim();
-                        } else {
-                            // 폴백: 날짜 패턴 텍스트 노드 탐색
-                            const walker = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
-                            while (walker.nextNode()) {
-                                const t = walker.currentNode.textContent.trim();
-                                if (/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2},\\s+\\d{4}$/.test(t) ||
-                                    /^\\d{4}-\\d{2}-\\d{2}$/.test(t)) {
-                                    dateText = t;
-                                    break;
-                                }
-                            }
-                        }
+                        // 날짜
+                        const dateEl = item.querySelector('[class*="reviewTime"]');
+                        const dateText = dateEl ? dateEl.textContent.trim() : '';
 
                         // 리뷰 텍스트
-                        let reviewText = '';
-                        const textEl = item.querySelector(
-                            '[class*="reviewText"], [class*="ReviewText"], [class*="review-text"], ' +
-                            '[class*="reviewContent"], [class*="ReviewContent"], [class*="review-content"], ' +
-                            '[class*="commentText"], [class*="CommentText"]'
-                        );
-                        if (textEl) {
-                            reviewText = textEl.textContent.trim();
-                        }
+                        const textEl = item.querySelector('[class*="reviewText"]');
+                        const reviewText = textEl ? textEl.textContent.trim() : '';
 
                         // 응답 수
-                        const replyCountEl = item.querySelector('[class*="replyCount"], [class*="ReplyCount"]');
+                        const replyCountEl = item.querySelector('[class*="replyCount"]');
                         const replyCountText = replyCountEl ? replyCountEl.textContent.trim() : '0';
 
                         // 주문 ID
-                        let orderId = '';
-                        const orderIdEl = item.querySelector(
-                            '[class*="productItemInfoOrderIdText"], [class*="OrderIdText"], ' +
-                            '[class*="orderId"], [class*="OrderId"], [class*="order-id"]'
-                        );
-                        if (orderIdEl) {
-                            orderId = orderIdEl.textContent.trim();
-                        } else {
-                            // 폴백: "Order ID" 텍스트 근처 탐색
-                            const allText = item.querySelectorAll('span, div, p');
-                            for (const el of allText) {
-                                const t = el.textContent.trim();
-                                if (t.includes('Order ID') || t.includes('Order:')) {
-                                    orderId = t;
-                                    break;
-                                }
-                            }
-                        }
+                        const orderIdEl = item.querySelector('[class*="productItemInfoOrderIdText"]');
+                        const orderId = orderIdEl ? orderIdEl.textContent.trim() : '';
 
                         // 제품 ID
-                        let productId = '';
-                        const productIdEl = item.querySelector(
-                            '[class*="productItemInfoProductId"], [class*="ProductId"], ' +
-                            '[class*="productId"], [class*="product-id"]'
-                        );
-                        if (productIdEl) {
-                            productId = productIdEl.textContent.trim();
-                        }
+                        const productIdEl = item.querySelector('[class*="productItemInfoProductId"]');
+                        const productId = productIdEl ? productIdEl.textContent.trim() : '';
 
                         // 제품명
-                        let productName = '';
-                        const productNameEl = item.querySelector(
-                            '[class*="productItemInfoName"], [class*="ProductName"], ' +
-                            '[class*="productName"], [class*="product-name"]'
-                        );
-                        if (productNameEl) {
-                            productName = productNameEl.textContent.trim();
-                        }
+                        const productNameEl = item.querySelector('[class*="productItemInfoName"]');
+                        const productName = productNameEl ? productNameEl.textContent.trim() : '';
 
                         // SKU/변형
-                        const skuEl = item.querySelector(
-                            '[class*="productItemInfoSku"], [class*="Sku"], [class*="sku"], [class*="variant"]'
-                        );
+                        const skuEl = item.querySelector('[class*="productItemInfoSku"]');
                         const sku = skuEl ? skuEl.textContent.trim() : '';
 
                         // 사용자명
-                        const usernameEl = item.querySelector(
-                            '[class*="userNameText"], [class*="UserNameText"], [class*="userName"], ' +
-                            '[class*="UserName"], [class*="user-name"], [class*="buyerName"], [class*="BuyerName"]'
-                        );
+                        const usernameEl = item.querySelector('[class*="userNameText"]');
                         const username = usernameEl ? usernameEl.textContent.trim() : '';
 
                         // 판매자 답변
-                        const replyEl = item.querySelector(
-                            '[class*="sellerReply"], [class*="SellerReply"], [class*="seller-reply"], ' +
-                            '[class*="replyContent"], [class*="ReplyContent"]'
-                        );
+                        const replyEl = item.querySelector('[class*="sellerReply"]');
                         const sellerReply = replyEl ? replyEl.textContent.trim() : '';
 
                         // 이미지 URL
                         const images = [];
-                        const imgEls = item.querySelectorAll('img');
+                        const imgEls = item.querySelectorAll('[class*="reviewImage"] img, [class*="mediaImage"] img');
                         imgEls.forEach(img => {
-                            const src = img.src || '';
-                            // 아바타/아이콘 제외, 리뷰 이미지만
-                            if (src && !src.includes('avatar') && !src.includes('icon') &&
-                                (src.includes('review') || src.includes('media') || src.includes('image') ||
-                                 img.width > 50 || img.naturalWidth > 50)) {
-                                images.push(src);
-                            }
+                            if (img.src) images.push(img.src);
                         });
 
                         // 비디오 여부
-                        const hasVideo = item.querySelector(
-                            '[class*="videoIcon"], [class*="VideoIcon"], [class*="playIcon"], ' +
-                            '[class*="PlayIcon"], video, [class*="video"]'
-                        ) !== null;
+                        const hasVideo = item.querySelector('[class*="videoIcon"], [class*="playIcon"]') !== null;
 
                         results.push({
                             star: activeStars,
