@@ -262,6 +262,7 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
                         'title': r.get('title', ''),
                         'author': r.get('author', ''),
                         'date': r.get('date', ''),
+                        'platform_country': region.upper(),
                         'author_country': r.get('location', ''),
                         'verified_purchase': r.get('verified_purchase', False),
                         'content': r.get('content', ''),

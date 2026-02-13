@@ -26,7 +26,7 @@ class BigQueryPublisher:
 
     # BigQuery 통합 스키마의 모든 컬럼 (순서 중요)
     ALL_COLUMNS = [
-        "review_id", "platform", "collected_at",
+        "review_id", "platform", "platform_country", "collected_at",
         "product_name", "product_id",
         "author", "author_country",
         "star", "title", "content", "date",
@@ -107,6 +107,7 @@ class BigQueryPublisher:
         normalized = {
             "review_id": str(review.get("review_id", "")),
             "platform": platform,
+            "platform_country": _normalize_country(review.get("platform_country"), platform),
             "collected_at": _to_timestamp(review.get("collected_at")) or _to_timestamp(collected_at),
             "product_name": _to_str(review.get("product_name")),
             "product_id": _to_str(review.get("product_id")),
@@ -224,10 +225,83 @@ class BigQueryPublisher:
 # =====================================================================
 
 _COUNTRY_NORMALIZE = {
+    # --- 영문 국가명 → ISO 2자리 코드 ---
     "United States": "US",
     "United Kingdom": "UK",
+    "Canada": "CA",
+    "Mexico": "MX",
+    "Brazil": "BR",
+    "India": "IN",
+    "Germany": "DE",
+    "France": "FR",
+    "Italy": "IT",
+    "Spain": "ES",
+    "Japan": "JP",
+    "Australia": "AU",
+    "Netherlands": "NL",
+    "Singapore": "SG",
+    "Philippines": "PH",
+    "Taiwan": "TW",
+    "Thailand": "TH",
+    "Vietnam": "VN",
+    "Malaysia": "MY",
+    "Indonesia": "ID",
+    "South Korea": "KR",
+    "China": "CN",
+    "Hong Kong": "HK",
+    "New Zealand": "NZ",
+    "Morocco": "MA",
+    "Trinidad and Tobago": "TT",
+    "Colombia": "CO",
+    "Argentina": "AR",
+    "Chile": "CL",
+    "Peru": "PE",
+    "Portugal": "PT",
+    "Poland": "PL",
+    "Sweden": "SE",
+    "Norway": "NO",
+    "Denmark": "DK",
+    "Finland": "FI",
+    "Belgium": "BE",
+    "Switzerland": "CH",
+    "Austria": "AT",
+    "Ireland": "IE",
+    "South Africa": "ZA",
+    "Egypt": "EG",
+    "Saudi Arabia": "SA",
+    "United Arab Emirates": "AE",
+    "Turkey": "TR",
+    "Russia": "RU",
+    "Ukraine": "UA",
+    "Israel": "IL",
+    "Nigeria": "NG",
+    "Kenya": "KE",
+    "Pakistan": "PK",
+    "Bangladesh": "BD",
+    "Sri Lanka": "LK",
+    # --- 소문자 변형 (Amazon 파서 결과 대비) ---
     "united states": "US",
     "united kingdom": "UK",
+    # --- 한국어 국가명 ---
+    "미국": "US",
+    "영국": "UK",
+    "캐나다": "CA",
+    "일본": "JP",
+    "독일": "DE",
+    "프랑스": "FR",
+    "호주": "AU",
+    "인도": "IN",
+    "싱가포르": "SG",
+    "필리핀": "PH",
+    "대만": "TW",
+    "태국": "TH",
+    "말레이시아": "MY",
+    "멕시코": "MX",
+    "브라질": "BR",
+    "중국": "CN",
+    "한국": "KR",
+    # --- ISO 코드 정규화 (GB → UK 통일) ---
+    "GB": "UK",
 }
 
 _PLATFORM_DEFAULT_COUNTRY = {
@@ -239,7 +313,18 @@ def _normalize_country(value: Any, platform: str) -> Optional[str]:
     """국가명을 ISO 2자리 코드로 정규화하고, 없으면 플랫폼 기본값 반환"""
     s = _to_str(value)
     if s:
-        return _COUNTRY_NORMALIZE.get(s, s)
+        s = s.strip()
+        # 정확한 매핑이 있으면 사용
+        if s in _COUNTRY_NORMALIZE:
+            return _COUNTRY_NORMALIZE[s]
+        # 대소문자 무시하고 한번 더 시도
+        for key, code in _COUNTRY_NORMALIZE.items():
+            if key.lower() == s.lower():
+                return code
+        # 이미 2자리 ISO 코드인 경우 대문자로 반환
+        if len(s) == 2 and s.isalpha():
+            return s.upper()
+        return s
     return _PLATFORM_DEFAULT_COUNTRY.get(platform)
 
 

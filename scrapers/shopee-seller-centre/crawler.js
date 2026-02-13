@@ -392,7 +392,7 @@ const crawlShopReviews = async (page, spcCds, shop) => {
 // ============================================================
 
 const formatReviews = (reviews, shop) => reviews.map((r) => ({
-  country: shop.name,
+  country: shop.region.toUpperCase(),
   comment_id: r.comment_id,
   order_sn: r.order_sn,
   user_name: r.user_name,

@@ -96,6 +96,10 @@ def _publish_to_bigquery(country_code: str, result: dict) -> dict:
         )
 
         reviews = result.get('reviews', [])
+        # platform_country = 마켓플레이스 국가, author_country = NULL (Shopee는 리뷰어 국가 미제공)
+        for r in reviews:
+            r['platform_country'] = country_code.upper()
+            r['author_country'] = None
         bq_result = publisher.publish_incremental(reviews, platform='shopee')
         logger.info(
             f"[{country_code.upper()}] BigQuery 업로드 완료: "

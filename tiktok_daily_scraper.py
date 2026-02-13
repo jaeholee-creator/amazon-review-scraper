@@ -155,6 +155,10 @@ def _publish_to_bigquery(result: dict) -> dict:
         )
 
         reviews = result.get('reviews', [])
+        # platform_country 설정 (환경변수로 확장 가능)
+        tiktok_country = os.environ.get('TIKTOK_PLATFORM_COUNTRY', 'US')
+        for r in reviews:
+            r['platform_country'] = tiktok_country
         bq_result = publisher.publish_incremental(reviews, platform='tiktok')
         logger.info(
             f"BigQuery 업로드 완료: insert={bq_result['inserted']}, update={bq_result['updated']}"
