@@ -93,17 +93,8 @@ def transform_to_bigquery_format(headers, data_rows):
             idx = header_map.get(key, -1)
             return row[idx] if idx != -1 and idx < len(row) else default
 
-        # submit_time → datetime 변환
-        submit_time = get_val('submit_time')
-        if submit_time and submit_time.isdigit():
-            review_date = datetime.fromtimestamp(int(submit_time))
-        else:
-            # submit_date 폴백
-            submit_date = get_val('submit_date')
-            try:
-                review_date = datetime.strptime(submit_date, '%Y-%m-%d')
-            except:
-                review_date = datetime.now()
+        # submit_date를 그대로 사용 (YYYY-MM-DD 문자열)
+        review_date = get_val('submit_date') or get_val('submit_time') or ''
 
         # BigQuery 형식으로 변환
         review = {

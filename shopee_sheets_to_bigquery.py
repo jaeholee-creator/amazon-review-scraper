@@ -113,20 +113,9 @@ def transform_to_bigquery_format(headers, data_rows):
             idx = header_map.get(key, -1)
             return row[idx] if idx != -1 and idx < len(row) else default
 
-        # submit_time → datetime 변환
-        submit_time = get_val('submit_time')
-        if submit_time and submit_time.replace('-', '').replace('.', '').isdigit():
-            try:
-                review_date = datetime.fromtimestamp(int(float(submit_time)))
-            except:
-                review_date = datetime.now()
-        else:
-            # submit_date 폴백
-            submit_date = get_val('submit_date')
-            try:
-                review_date = datetime.strptime(submit_date, '%Y-%m-%d')
-            except:
-                review_date = datetime.now()
+        # submit_date를 그대로 사용 (YYYY-MM-DD 문자열)
+        # _to_date_str가 다양한 형식을 처리하므로 문자열 그대로 전달
+        review_date = get_val('submit_date') or get_val('submit_time') or ''
 
         # rating_star 안전 변환
         rating_star = get_val('rating_star', '0')

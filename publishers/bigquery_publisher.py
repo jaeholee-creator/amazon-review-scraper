@@ -366,12 +366,23 @@ def _to_date_str(value: Any) -> Optional[str]:
     """다양한 날짜 형식을 YYYY-MM-DD 문자열로 변환"""
     if value is None or value == "":
         return None
+
+    # datetime 객체 직접 처리
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if hasattr(value, 'isoformat'):  # date 객체
+        return str(value)
+
     s = str(value).strip()
+
     # 이미 YYYY-MM-DD 형식이면 그대로
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         return s
     # YYYY-MM-DDTHH:MM:SS 형식이면 날짜만 추출
     if "T" in s:
+        return s[:10]
+    # "YYYY-MM-DD HH:MM:SS" 형식 (공백 구분) → 날짜만 추출
+    if len(s) > 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
     # MM/DD/YYYY 형식
     if "/" in s:
@@ -381,6 +392,18 @@ def _to_date_str(value: Any) -> Optional[str]:
                 return f"{parts[2]}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
             except (ValueError, IndexError):
                 pass
+    # 영문 날짜: "February 11, 2026", "January 1, 2025" 등
+    try:
+        parsed = datetime.strptime(s, "%B %d, %Y")
+        return parsed.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # Unix timestamp (10자리 정수)
+    if s.isdigit() and len(s) >= 9:
+        try:
+            return datetime.fromtimestamp(int(s)).strftime("%Y-%m-%d")
+        except (ValueError, OSError):
+            pass
     return None
 
 
