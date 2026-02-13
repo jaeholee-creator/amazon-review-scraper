@@ -18,6 +18,7 @@ import sys
 import time
 import random
 import re
+from datetime import datetime, timezone
 
 
 # =============================================================================
@@ -118,22 +119,48 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
     print(f"   Mode: {'TEST' if test_mode else 'FULL'} (max {max_pages} pages)")
     print(f"{'='*60}")
 
-    # Step 1: Google Sheets에서 기존 ID 조회 (중복 방지 - 단일 소스)
-    print("\n[Step 1] Fetching existing review IDs from Google Sheets...")
+    # Publisher 타입 결정
+    publisher_type = os.environ.get('PUBLISHER_TYPE', 'bigquery')
+    bq_publisher = None
+
+    if publisher_type == 'bigquery':
+        try:
+            from publishers.bigquery_publisher import BigQueryPublisher
+            bq_publisher = BigQueryPublisher(
+                project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
+                dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+                table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
+                credentials_file='config/bigquery-service-account.json',
+            )
+            print(f"   Publisher: BigQuery ({bq_publisher.full_table_id})")
+        except Exception as e:
+            print(f"   BigQuery 초기화 실패: {e}. Sheets로 전환합니다.")
+            publisher_type = 'sheets'
+
+    # Step 1: 기존 review ID 조회 (중복 방지)
+    print("\n[Step 1] Fetching existing review IDs...")
     collected_ids = set()
     uploader = None
-    try:
-        from src.sheets_uploader import SheetsUploader
-        uploader = SheetsUploader(credentials_file='credentials.json')
-        sheets_ids = uploader.get_existing_review_ids(
-            cfg['google_sheets_url'], cfg['sheet_name']
-        )
-        collected_ids.update(sheets_ids)
-        print(f"   Sheets IDs: {len(sheets_ids)}")
-    except FileNotFoundError:
-        print("   credentials.json not found. Skipping Sheets ID check.")
-    except Exception as e:
-        print(f"   Sheets ID fetch error: {e}")
+
+    if publisher_type == 'bigquery' and bq_publisher:
+        try:
+            collected_ids = bq_publisher.get_existing_review_ids('amazon', days=90)
+            print(f"   BigQuery IDs: {len(collected_ids)}")
+        except Exception as e:
+            print(f"   BigQuery ID fetch error: {e}")
+    else:
+        try:
+            from src.sheets_uploader import SheetsUploader
+            uploader = SheetsUploader(credentials_file='credentials.json')
+            sheets_ids = uploader.get_existing_review_ids(
+                cfg['google_sheets_url'], cfg['sheet_name']
+            )
+            collected_ids.update(sheets_ids)
+            print(f"   Sheets IDs: {len(sheets_ids)}")
+        except FileNotFoundError:
+            print("   credentials.json not found. Skipping Sheets ID check.")
+        except Exception as e:
+            print(f"   Sheets ID fetch error: {e}")
 
     # Step 2: 세션 초기화 (Chromium, ARM64 호환)
     print("\n[Step 2] Session initialization...")
@@ -213,37 +240,70 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
 
     print(f"{'='*60}")
 
-    # Step 5: Google Sheets 업로드 (중복은 이미 Step 1에서 필터링됨)
-    print("\n[Step 5] Uploading to Google Sheets...")
-    try:
-        if uploader is None:
-            from src.sheets_uploader import SheetsUploader
-            uploader = SheetsUploader(credentials_file='credentials.json')
+    # Step 5: 데이터 업로드
+    all_reviews = []
+    for result in results:
+        all_reviews.extend(result['reviews'])
 
-        all_reviews = []
-        for result in results:
-            all_reviews.extend(result['reviews'])
+    if publisher_type == 'bigquery' and bq_publisher:
+        print("\n[Step 5] Publishing to BigQuery...")
+        try:
+            if all_reviews:
+                # Amazon 스크래퍼 키 → BigQuery 스키마 키 매핑
+                # product_name은 results 레벨에 있으므로 review에 포함
+                product_name_map = {r['asin']: r['product_name'] for r in results}
+                mapped_reviews = []
+                for r in all_reviews:
+                    mapped_reviews.append({
+                        'review_id': r.get('review_id', ''),
+                        'product_id': r.get('asin', ''),
+                        'product_name': product_name_map.get(r.get('asin', ''), ''),
+                        'star': r.get('rating', ''),
+                        'title': r.get('title', ''),
+                        'author': r.get('author', ''),
+                        'date': r.get('date', ''),
+                        'author_country': r.get('location', ''),
+                        'verified_purchase': r.get('verified_purchase', False),
+                        'content': r.get('content', ''),
+                        'likes_count': r.get('helpful_count', 0),
+                        'collected_at': r.get('scraped_at', datetime.now(timezone.utc).isoformat()),
+                    })
 
-        if all_reviews:
-            upload_result = uploader.upload_reviews(
-                spreadsheet_url=cfg['google_sheets_url'],
-                sheet_name=cfg['sheet_name'],
-                reviews=all_reviews,
-                append=True,
-            )
-
-            if upload_result['success']:
-                print(f"   Sheets: {upload_result['rows_added']} rows added")
-                print(f"   Total rows: {upload_result['total_rows']}")
+                bq_result = bq_publisher.publish_incremental(
+                    mapped_reviews, platform='amazon',
+                )
+                print(f"   BigQuery: insert={bq_result['inserted']}, update={bq_result['updated']}")
             else:
-                print(f"   Sheets error: {upload_result.get('error', 'Unknown error')}")
-        else:
-            print("   No reviews to upload")
+                print("   No reviews to upload")
+        except Exception as e:
+            print(f"   BigQuery error: {e}")
+    else:
+        print("\n[Step 5] Uploading to Google Sheets...")
+        try:
+            if uploader is None:
+                from src.sheets_uploader import SheetsUploader
+                uploader = SheetsUploader(credentials_file='credentials.json')
 
-    except FileNotFoundError:
-        print("   credentials.json not found. Skipping upload.")
-    except Exception as e:
-        print(f"   Sheets error: {e}")
+            if all_reviews:
+                upload_result = uploader.upload_reviews(
+                    spreadsheet_url=cfg['google_sheets_url'],
+                    sheet_name=cfg['sheet_name'],
+                    reviews=all_reviews,
+                    append=True,
+                )
+
+                if upload_result['success']:
+                    print(f"   Sheets: {upload_result['rows_added']} rows added")
+                    print(f"   Total rows: {upload_result['total_rows']}")
+                else:
+                    print(f"   Sheets error: {upload_result.get('error', 'Unknown error')}")
+            else:
+                print("   No reviews to upload")
+
+        except FileNotFoundError:
+            print("   credentials.json not found. Skipping upload.")
+        except Exception as e:
+            print(f"   Sheets error: {e}")
 
     # Step 6: Slack 알림
     print("\n[Step 6] Sending Slack notification...")

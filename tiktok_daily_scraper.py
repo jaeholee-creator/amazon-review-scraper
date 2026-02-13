@@ -27,6 +27,8 @@ from config.settings import (
     get_tiktok_collection_date_range,
 )
 
+PUBLISHER_TYPE = os.environ.get('PUBLISHER_TYPE', 'bigquery')
+
 # 로깅 설정
 os.makedirs("data/tiktok", exist_ok=True)
 
@@ -128,20 +130,44 @@ async def scrape_tiktok_reviews() -> dict:
         return {"status": "failed", "error": str(e), "reviews": [], "total_reviews": 0}
 
 
-def publish_to_sheets(result: dict) -> dict:
-    """
-    Google Sheets에 업로드
-
-    Args:
-        result: 스크래핑 결과
-
-    Returns:
-        업로드 결과 dict
-    """
+def publish_reviews(result: dict) -> dict:
+    """리뷰 데이터를 BigQuery 또는 Google Sheets에 업로드"""
     if not result or not result.get("reviews"):
         logger.info("업로드할 리뷰가 없습니다")
         return {}
 
+    if PUBLISHER_TYPE == 'bigquery':
+        return _publish_to_bigquery(result)
+    return _publish_to_sheets(result)
+
+
+def _publish_to_bigquery(result: dict) -> dict:
+    """BigQuery에 업로드"""
+    logger.info("BigQuery 업로드 시작")
+
+    try:
+        from publishers.bigquery_publisher import BigQueryPublisher
+        publisher = BigQueryPublisher(
+            project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
+            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+            table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
+            credentials_file='config/bigquery-service-account.json',
+        )
+
+        reviews = result.get('reviews', [])
+        bq_result = publisher.publish_incremental(reviews, platform='tiktok')
+        logger.info(
+            f"BigQuery 업로드 완료: insert={bq_result['inserted']}, update={bq_result['updated']}"
+        )
+        return {'appended_reviews': bq_result['inserted']}
+
+    except Exception as e:
+        logger.error(f"BigQuery 업로드 실패: {e}", exc_info=True)
+        return {}
+
+
+def _publish_to_sheets(result: dict) -> dict:
+    """Google Sheets에 업로드 (폴백)"""
     logger.info(f"Google Sheets 업로드 시작: {TIKTOK_SHEET_NAME}")
 
     try:
@@ -184,10 +210,10 @@ async def main():
     # 1. 리뷰 수집
     scrape_result = await scrape_tiktok_reviews()
 
-    # 2. Google Sheets 업로드
+    # 2. 데이터 업로드 (BigQuery 또는 Google Sheets)
     publish_result = {}
     if scrape_result.get("status") == "success":
-        publish_result = publish_to_sheets(scrape_result)
+        publish_result = publish_reviews(scrape_result)
     else:
         logger.warning(f"스크래핑 실패: {scrape_result.get('error', 'Unknown')}")
 

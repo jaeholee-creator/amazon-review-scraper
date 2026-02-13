@@ -4,6 +4,7 @@ Shopee Daily Review Scraper
 매일 최근 3일간의 Shopee 리뷰를 수집하여 Google Sheets에 업로드
 """
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -15,6 +16,8 @@ from config.settings import (
     SHOPEE_SPREADSHEET_ID,
     get_shopee_collection_date_range,
 )
+
+PUBLISHER_TYPE = os.environ.get('PUBLISHER_TYPE', 'bigquery')
 
 # 로깅 설정
 logging.basicConfig(
@@ -68,21 +71,45 @@ def scrape_shopee_country(country_code: str) -> dict:
         return {}
 
 
-def publish_to_sheets(country_code: str, result: dict) -> dict:
-    """
-    Google Sheets에 업로드
-
-    Args:
-        country_code: 국가 코드
-        result: 스크래핑 결과
-
-    Returns:
-        업로드 결과 dict
-    """
+def publish_reviews(country_code: str, result: dict) -> dict:
+    """리뷰 데이터를 BigQuery 또는 Google Sheets에 업로드"""
     if not result or not result.get('reviews'):
         logger.info(f"[{country_code.upper()}] 업로드할 리뷰가 없습니다")
         return {}
 
+    if PUBLISHER_TYPE == 'bigquery':
+        return _publish_to_bigquery(country_code, result)
+    return _publish_reviews(country_code, result)
+
+
+def _publish_to_bigquery(country_code: str, result: dict) -> dict:
+    """BigQuery에 업로드"""
+    logger.info(f"[{country_code.upper()}] BigQuery 업로드 시작")
+
+    try:
+        from publishers.bigquery_publisher import BigQueryPublisher
+        publisher = BigQueryPublisher(
+            project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
+            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+            table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
+            credentials_file='config/bigquery-service-account.json',
+        )
+
+        reviews = result.get('reviews', [])
+        bq_result = publisher.publish_incremental(reviews, platform='shopee')
+        logger.info(
+            f"[{country_code.upper()}] BigQuery 업로드 완료: "
+            f"insert={bq_result['inserted']}, update={bq_result['updated']}"
+        )
+        return {'appended_reviews': bq_result['inserted']}
+
+    except Exception as e:
+        logger.error(f"[{country_code.upper()}] BigQuery 업로드 실패: {e}", exc_info=True)
+        return {}
+
+
+def _publish_reviews(country_code: str, result: dict) -> dict:
+    """Google Sheets에 업로드 (폴백)"""
     shop_config = SHOPEE_SHOPS.get(country_code)
     sheet_name = shop_config['sheet_name']
 
@@ -126,7 +153,7 @@ def main():
     logger.info("=" * 80)
     sg_result = scrape_shopee_country('sg')
     if sg_result:
-        sg_publish = publish_to_sheets('sg', sg_result)
+        sg_publish = publish_reviews('sg', sg_result)
         results['sg'] = {
             'scrape': sg_result,
             'publish': sg_publish
@@ -138,7 +165,7 @@ def main():
     logger.info("=" * 80)
     ph_result = scrape_shopee_country('ph')
     if ph_result:
-        ph_publish = publish_to_sheets('ph', ph_result)
+        ph_publish = publish_reviews('ph', ph_result)
         results['ph'] = {
             'scrape': ph_result,
             'publish': ph_publish

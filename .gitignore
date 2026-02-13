@@ -67,6 +67,7 @@ data/biodance/
 
 # 서비스 계정 키
 config/service-account.json
+config/bigquery-service-account.json
 credentials-gmail.json
 
 # Node.js (shopee-seller-centre)
