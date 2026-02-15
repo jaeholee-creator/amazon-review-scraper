@@ -35,6 +35,49 @@ logger = logging.getLogger(__name__)
 DATA_DIR = os.path.join(project_root, "data", "biodance")
 
 
+def _publish_to_bigquery(results: dict):
+    """Biodance 리뷰를 BigQuery에 발행"""
+    try:
+        from publishers.bigquery_publisher import BigQueryPublisher
+
+        publisher = BigQueryPublisher(
+            project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
+            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+            table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
+            credentials_file=os.environ.get(
+                'BIGQUERY_CREDENTIALS_FILE', 'config/bigquery-service-account.json'
+            ),
+        )
+
+        # Biodance 리뷰를 BigQuery 스키마에 맞게 변환
+        reviews = []
+        for product in results.get("products", []):
+            for review in product.get("reviews", []):
+                reviews.append({
+                    'review_id': review.get('review_id', ''),
+                    'platform': 'biodance',
+                    'platform_country': 'KR',
+                    'product_name': product.get('product_name', ''),
+                    'product_id': str(product.get('product_id', '')),
+                    'author': review.get('author', ''),
+                    'star': review.get('rating', 0),
+                    'content': review.get('content', ''),
+                    'date': review.get('date', ''),
+                })
+
+        if not reviews:
+            logger.info("BigQuery: 업로드할 리뷰가 없습니다")
+            return
+
+        bq_result = publisher.publish_incremental(reviews, platform='biodance')
+        logger.info(
+            "BigQuery 업로드 완료: insert=%d, update=%d",
+            bq_result['inserted'], bq_result['updated'],
+        )
+    except Exception as e:
+        logger.error("BigQuery 업로드 실패: %s", e, exc_info=True)
+
+
 def main():
     start_time = time.time()
 
@@ -44,10 +87,16 @@ def main():
     logger.info("Biodance 리뷰 증분 수집을 시작합니다...")
     results, new_count = crawler.collect_incremental(json_path)
 
-    # 로컬 파일 저장 제거 - Google Sheets만 사용
+    # 로컬 파일 저장 제거 - Google Sheets가 Single Source of Truth
     logger.info("로컬 파일 저장 생략 (Google Sheets가 Single Source of Truth)")
 
-    # Google Sheets 발행 (신규)
+    publisher_type = os.environ.get('PUBLISHER_TYPE', 'sheets')
+
+    # BigQuery 발행
+    if publisher_type == 'bigquery':
+        _publish_to_bigquery(results)
+
+    # Google Sheets 발행
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
     service_account_file = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE", "config/service-account.json")
 
@@ -62,7 +111,7 @@ def main():
             stats = publisher.publish_incremental(results)
 
             logger.info("=" * 60)
-            logger.info("✅ Google Sheets 업데이트 완료!")
+            logger.info("Google Sheets 업데이트 완료!")
             logger.info("신규 리뷰: %d개", stats["new_reviews"])
             logger.info("추가된 행: %d개", stats["appended_reviews"])
             logger.info("총 리뷰: %d개", stats["total_reviews"])

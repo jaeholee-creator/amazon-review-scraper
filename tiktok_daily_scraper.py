@@ -268,7 +268,12 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        result = asyncio.run(main())
+        # 스크래핑 실패 시 non-zero exit code로 Airflow에 실패 전파
+        scrape_status = result.get("scrape", {}).get("status", "unknown")
+        if scrape_status != "success":
+            logger.error(f"스크래핑 실패 (status={scrape_status}) - exit code 1")
+            sys.exit(1)
     except Exception as e:
         logger.error(f"실행 중 에러 발생: {e}", exc_info=True)
         sys.exit(1)

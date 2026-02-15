@@ -281,7 +281,12 @@ class BrowserSession:
                     submit_btn = await page.query_selector('#auth-signin-button, button[type="submit"]')
                     if submit_btn:
                         await submit_btn.click()
-                        await page.wait_for_timeout(4000)
+                        # MFA 페이지 탈출 대기 (최대 15초, 1초 간격 폴링)
+                        for _ in range(15):
+                            await page.wait_for_timeout(1000)
+                            current = page.url
+                            if '/ap/mfa' not in current and '/ap/signin' not in current:
+                                break
                         print(f"   OTP submitted. URL: {page.url}")
                 else:
                     print("   2FA/OTP required but no TOTP secret configured")
