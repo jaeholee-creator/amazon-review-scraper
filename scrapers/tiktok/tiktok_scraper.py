@@ -349,17 +349,11 @@ class TikTokShopScraper:
                 await email_tab.click()
                 await page.wait_for_timeout(1000)
 
-            # === 핵심: Locator API + React native setter로 입력 ===
-            # 디버그: 현재 페이지의 모든 input 필드 확인
-            inputs_info = await page.evaluate("""
-                () => Array.from(document.querySelectorAll('input')).map(el => ({
-                    name: el.name, type: el.type, visible: el.offsetParent !== null,
-                    placeholder: el.placeholder, cls: (el.className || '').substring(0, 80)
-                }))
-            """)
-            logger.info(f"페이지 input 필드: {inputs_info}")
+            # === 인간 유사 입력: press_sequentially + 랜덤 딜레이 ===
+            # fill()은 즉시 입력이라 TikTok 행동 분석에 봇으로 감지됨.
+            # 실제 키보드 이벤트(press_sequentially)로 입력해야 함.
 
-            # 이메일 입력: Locator로 가시적인 이메일 필드 찾기
+            # 이메일 필드 찾기
             email_selectors = [
                 'input[name="email"]:visible',
                 'input[type="email"]:visible',
@@ -370,53 +364,21 @@ class TikTokShopScraper:
                 try:
                     locator = page.locator(sel).first
                     if await locator.count() > 0:
-                        # 방법 1: Locator.fill() - Playwright가 React 이벤트도 트리거
-                        await locator.fill(self.email)
-                        await page.wait_for_timeout(300)
-                        val = await locator.input_value()
-                        if val == self.email:
-                            logger.info(f"이메일 Locator.fill() 성공: {sel}")
-                            email_filled = True
+                        email_filled = await self._human_type_field(locator, self.email, "이메일")
+                        if email_filled:
                             break
-                        # 방법 2: Native setter + React event dispatch
-                        logger.info(f"fill() 값 불일치 '{val}' - native setter 시도")
-                        await locator.evaluate("""
-                            (el, text) => {
-                                const nativeSetter = Object.getOwnPropertyDescriptor(
-                                    window.HTMLInputElement.prototype, 'value'
-                                ).set;
-                                nativeSetter.call(el, text);
-                                el.dispatchEvent(new Event('input', { bubbles: true }));
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
-                            }
-                        """, self.email)
-                        await page.wait_for_timeout(300)
-                        val = await locator.input_value()
-                        if val == self.email:
-                            logger.info(f"이메일 native setter 성공: {sel}")
-                            email_filled = True
-                            break
-                        # 방법 3: press_sequentially (실제 키 이벤트)
-                        logger.info(f"native setter 후 값 '{val}' - press_sequentially 시도")
-                        await locator.click()
-                        await page.keyboard.press("Control+a")
-                        await locator.press_sequentially(self.email, delay=50)
-                        await page.wait_for_timeout(300)
-                        val = await locator.input_value()
-                        if val == self.email:
-                            logger.info(f"이메일 press_sequentially 성공: {sel}")
-                            email_filled = True
-                            break
-                        logger.warning(f"이메일 입력 모든 방법 실패: '{val}'")
                 except Exception as e:
                     logger.debug(f"이메일 셀렉터 {sel} 실패: {e}")
 
             if not email_filled:
-                logger.error("이메일 입력 실패 - 모든 방법 시도 완료")
+                logger.error("이메일 입력 실패")
                 await page.screenshot(path=f"{self.data_dir}/debug_email_fail.png")
                 return False
 
-            # 비밀번호 입력: 같은 전략
+            # 이메일 → 비밀번호 필드 이동 사이 인간적 대기
+            await page.wait_for_timeout(random.randint(500, 1200))
+
+            # 비밀번호 필드 찾기
             pw_selectors = [
                 'input[type="password"]:visible',
                 'input[name="password"]:visible',
@@ -426,39 +388,8 @@ class TikTokShopScraper:
                 try:
                     locator = page.locator(sel).first
                     if await locator.count() > 0:
-                        await locator.fill(self.password)
-                        await page.wait_for_timeout(300)
-                        val = await locator.input_value()
-                        if val == self.password:
-                            logger.info(f"비밀번호 Locator.fill() 성공")
-                            pw_filled = True
-                            break
-                        # Native setter fallback
-                        await locator.evaluate("""
-                            (el, text) => {
-                                const nativeSetter = Object.getOwnPropertyDescriptor(
-                                    window.HTMLInputElement.prototype, 'value'
-                                ).set;
-                                nativeSetter.call(el, text);
-                                el.dispatchEvent(new Event('input', { bubbles: true }));
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
-                            }
-                        """, self.password)
-                        await page.wait_for_timeout(300)
-                        val = await locator.input_value()
-                        if val == self.password:
-                            logger.info("비밀번호 native setter 성공")
-                            pw_filled = True
-                            break
-                        # press_sequentially fallback
-                        await locator.click()
-                        await page.keyboard.press("Control+a")
-                        await locator.press_sequentially(self.password, delay=50)
-                        await page.wait_for_timeout(300)
-                        val = await locator.input_value()
-                        if val == self.password:
-                            logger.info("비밀번호 press_sequentially 성공")
-                            pw_filled = True
+                        pw_filled = await self._human_type_field(locator, self.password, "비밀번호")
+                        if pw_filled:
                             break
                 except Exception as e:
                     logger.debug(f"비밀번호 셀렉터 {sel} 실패: {e}")
@@ -467,14 +398,20 @@ class TikTokShopScraper:
                 logger.error("비밀번호 입력 실패")
                 return False
 
+            # 비밀번호 입력 → Continue 클릭 사이 인간적 대기
+            await page.wait_for_timeout(random.randint(800, 1500))
+
             # 스크린샷: Continue 클릭 전
             await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
 
-            # Continue 버튼 클릭
+            # Continue 버튼 클릭 (마우스 이동 + 클릭)
             continue_btn = page.locator('button:has-text("Continue"):visible').first
             if await continue_btn.count() > 0:
                 is_disabled = await continue_btn.evaluate("el => el.disabled")
                 logger.info(f"Continue 버튼: disabled={is_disabled}")
+                # 버튼 위로 마우스 이동 후 짧은 대기 → 클릭 (인간 행동 모방)
+                await continue_btn.hover()
+                await page.wait_for_timeout(random.randint(200, 500))
                 await continue_btn.click()
                 logger.info("Continue 버튼 클릭 완료")
             else:
@@ -738,6 +675,53 @@ class TikTokShopScraper:
         except Exception as e:
             logger.warning(f"캡차 처리 중 오류: {e}")
             return True
+
+    async def _human_type_field(self, locator, text: str, label: str) -> bool:
+        """인간 유사 키보드 입력으로 필드에 텍스트를 입력.
+
+        TikTok의 행동 분석 우회를 위해:
+        1. 필드 클릭 → 짧은 대기
+        2. 기존 텍스트 선택 삭제
+        3. press_sequentially (80~200ms 랜덤 딜레이/키)
+        4. 입력값 검증
+        """
+        page = self._page
+        try:
+            # 필드 클릭 (포커스)
+            await locator.click()
+            await page.wait_for_timeout(random.randint(200, 500))
+
+            # 기존 텍스트 전체 선택 후 삭제
+            await page.keyboard.press("Control+a")
+            await page.wait_for_timeout(100)
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(random.randint(100, 300))
+
+            # 글자별 입력 (랜덤 딜레이)
+            delay = random.randint(80, 150)
+            await locator.press_sequentially(text, delay=delay)
+            await page.wait_for_timeout(random.randint(200, 500))
+
+            # 입력값 검증
+            val = await locator.input_value()
+            if val == text:
+                logger.info(f"{label} 입력 성공 (press_sequentially, delay={delay}ms)")
+                return True
+
+            # fallback: fill() 시도
+            logger.warning(f"{label} press_sequentially 후 값 불일치 '{val}' → fill() 시도")
+            await locator.fill(text)
+            await page.wait_for_timeout(300)
+            val = await locator.input_value()
+            if val == text:
+                logger.info(f"{label} fill() 폴백 성공")
+                return True
+
+            logger.error(f"{label} 입력 실패: '{val}'")
+            return False
+        except Exception as e:
+            logger.error(f"{label} 입력 오류: {e}")
+            return False
 
     async def _recover_session(self) -> bool:
         """세션 만료 시 재로그인을 시도하여 세션 복구.
