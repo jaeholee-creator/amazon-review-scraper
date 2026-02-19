@@ -45,7 +45,7 @@ def _build_bash_command(script: str, args: str = '') -> str:
 with DAG(
     dag_id='review_scraper',
     default_args=default_args,
-    description='5개 플랫폼 리뷰 수집 (Amazon US/UK, Biodance, Shopee, TikTok)',
+    description='5개 플랫폼 리뷰 수집 (Amazon US/UK, Biodance, Shopee, TikTok) + TikTok 세션 유지',
     schedule='0 0 * * *',  # 매일 UTC 00:00 (KST 09:00)
     start_date=datetime(2026, 2, 11),
     catchup=False,
@@ -105,28 +105,40 @@ with DAG(
     )
 
     # =========================================================================
-    # Task 5: TikTok Shop 리뷰 수집
+    # Task 5: TikTok 세션 Heartbeat (쿠키 갱신)
     # =========================================================================
-    # TEMPORARILY DISABLED: Rate limit 차단으로 인해 일시 중지 (2026-02-12)
-    # 해결 방법:
-    #   1. 24-48시간 대기 후 Rate Limit 해제 확인
-    #   2. 프록시 서버 사용 고려
-    #   3. User-Agent 변경 및 요청 간격 증가
-    # 재활성화 시: 아래 주석 해제
-    # tiktok = BashOperator(
-    #     task_id='tiktok_reviews',
-    #     bash_command=_build_bash_command('tiktok_daily_scraper.py'),
-    #     env={
-    #         **common_env,
-    #         'TIKTOK_HEADLESS': 'true',
-    #     },
-    #     append_env=True,
-    #     execution_timeout=timedelta(minutes=30),
-    #     retries=2,
-    # )
+    tiktok_heartbeat = BashOperator(
+        task_id='tiktok_session_heartbeat',
+        bash_command=_build_bash_command('scripts/session_heartbeat.py'),
+        env={
+            **common_env,
+            'DISPLAY': ':99',
+            'TIKTOK_DATA_DIR': 'data/tiktok',
+        },
+        append_env=True,
+        execution_timeout=timedelta(minutes=5),
+        retries=1,
+    )
 
     # =========================================================================
-    # Task 6: 완료 알림
+    # Task 6: TikTok Shop 리뷰 수집
+    # =========================================================================
+    tiktok = BashOperator(
+        task_id='tiktok_reviews',
+        bash_command=_build_bash_command('tiktok_daily_scraper.py'),
+        env={
+            **common_env,
+            'DISPLAY': ':99',
+            'TIKTOK_HEADLESS': 'false',
+            'SADCAPTCHA_API_KEY': 'b0bd7e66a62af0c4e0c755f73195717e',
+        },
+        append_env=True,
+        execution_timeout=timedelta(minutes=30),
+        retries=2,
+    )
+
+    # =========================================================================
+    # Task 7: 완료 알림
     # =========================================================================
     notify_completion = BashOperator(
         task_id='notify_completion',
@@ -135,9 +147,10 @@ with DAG(
     )
 
     # =========================================================================
-    # Task 의존성 (병렬 실행 → 완료 알림)
+    # Task 의존성
     # =========================================================================
     # Amazon US/UK, Biodance, Shopee → 병렬 실행
-    # TikTok은 임시 비활성화 (Rate Limit)
+    # TikTok: heartbeat(쿠키 갱신) → 리뷰 수집
     # 전부 끝나면 → notify_completion
-    [amazon_us, amazon_uk, biodance, shopee] >> notify_completion
+    tiktok_heartbeat >> tiktok
+    [amazon_us, amazon_uk, biodance, shopee, tiktok] >> notify_completion

@@ -1,12 +1,12 @@
 """
-TikTok 슬라이더 퍼즐 캡차 자동 풀기.
+TikTok 슬라이더/회전 퍼즐 캡차 자동 풀기.
 
-TikTok Seller Center 로그인 시 나타나는 원형 퍼즐 캡차를 자동으로 풀어줍니다.
-배경 이미지의 갭 위치를 탐지하고 슬라이더를 인간처럼 드래그합니다.
+TikTok Seller Center 로그인 시 나타나는 캡차를 자동으로 풀어줍니다.
 
-갭 위치 탐지 전략 (우선순위):
-1. OpenCV matchTemplate + Canny (80-92% 정확도) - 배경+퍼즐 조각 비교
-2. 로컬 에지 디텍션 (Pillow 기반) - 최종 폴백
+풀기 전략 (우선순위):
+1. SadCaptcha API (98-100% 정확도, $0.002/건) - 회전+슬라이더 모두 지원
+2. OpenCV matchTemplate + Canny (80-92% 정확도) - 슬라이더 전용
+3. 로컬 에지 디텍션 (Pillow 기반) - 최종 폴백
 """
 import asyncio
 import base64
@@ -26,11 +26,18 @@ except ImportError:
     HAS_OPENCV = False
     logging.getLogger(__name__).warning("OpenCV 미설치 → PIL 폴백만 사용 가능")
 
+# SadCaptcha tiktok-captcha-solver 패키지 (Patchright Page 호환)
+try:
+    from tiktok_captcha_solver import AsyncPlaywrightSolver
+    HAS_SADCAPTCHA_PKG = True
+except ImportError:
+    HAS_SADCAPTCHA_PKG = False
+
 logger = logging.getLogger(__name__)
 
 
 class TikTokCaptchaSolver:
-    """TikTok 슬라이더 퍼즐 캡차 자동 풀기"""
+    """TikTok 슬라이더/회전 퍼즐 캡차 자동 풀기"""
 
     MAX_RETRIES = 3
 
@@ -43,8 +50,9 @@ class TikTokCaptchaSolver:
     REFRESH_SEL = "#captcha_refresh_button"
     CLOSE_SEL = "#captcha_close_button"
 
-    def __init__(self, page):
+    def __init__(self, page, sadcaptcha_api_key: str = ""):
         self.page = page
+        self.sadcaptcha_api_key = sadcaptcha_api_key
 
     async def is_captcha_visible(self) -> bool:
         """슬라이더 캡차가 화면에 표시되어 있는지 확인."""
@@ -65,15 +73,150 @@ class TikTokCaptchaSolver:
         return False
 
     async def solve(self) -> bool:
-        """캡차 풀기 (최대 MAX_RETRIES번 시도). 실패 시 오프셋 지터 적용."""
-        self._jitter_offset = 0.0  # 재시도 시 적용할 오프셋
+        """캡차 풀기. 전략: SadCaptcha API → 로컬 OpenCV/PIL → 실패."""
+        if not await self.is_captcha_visible():
+            logger.info("캡차가 없음 - 통과")
+            return True
+
+        # 1순위: SadCaptcha API (98-100% 정확도, 회전+슬라이더 모두 지원)
+        if self.sadcaptcha_api_key:
+            success = await self._solve_with_sadcaptcha()
+            if success:
+                return True
+            logger.warning("SadCaptcha API 실패 → 로컬 솔버로 폴백")
+
+        # 2순위: 로컬 OpenCV/PIL 솔버
+        return await self._solve_with_local_solver()
+
+    async def _solve_with_sadcaptcha(self) -> bool:
+        """SadCaptcha API로 캡차 풀기 (tiktok-captcha-solver 패키지 사용)."""
+        if HAS_SADCAPTCHA_PKG:
+            return await self._solve_with_sadcaptcha_package()
+        return await self._solve_with_sadcaptcha_rest_api()
+
+    async def _solve_with_sadcaptcha_package(self) -> bool:
+        """tiktok-captcha-solver PyPI 패키지로 캡차 풀기."""
+        try:
+            logger.info("SadCaptcha 패키지로 캡차 풀기 시도...")
+            solver = AsyncPlaywrightSolver(
+                self.page,
+                self.sadcaptcha_api_key,
+            )
+            await solver.solve_captcha_if_present()
+
+            # 풀기 후 캡차 사라졌는지 확인
+            await asyncio.sleep(3)
+            if not await self.is_captcha_visible():
+                logger.info("SadCaptcha 패키지: 캡차 풀기 성공!")
+                return True
+
+            logger.warning("SadCaptcha 패키지: 캡차 여전히 표시됨")
+            return False
+
+        except Exception as e:
+            logger.warning(f"SadCaptcha 패키지 오류: {e}")
+            return False
+
+    async def _solve_with_sadcaptcha_rest_api(self) -> bool:
+        """SadCaptcha REST API로 직접 캡차 풀기 (패키지 미설치 시 폴백)."""
+        try:
+            import requests
+
+            logger.info("SadCaptcha REST API로 캡차 풀기 시도...")
+
+            # 캡차 이미지 추출 (배경 + 퍼즐 조각)
+            bg_img_el = await self.page.query_selector(self.BG_IMAGE_SEL)
+            piece_img_el = await self.page.query_selector(self.PIECE_IMAGE_SEL)
+
+            if not bg_img_el:
+                logger.warning("SadCaptcha API: 배경 이미지를 찾을 수 없음")
+                return False
+
+            bg_src = await bg_img_el.get_attribute("src")
+            if not bg_src or not bg_src.startswith("data:image"):
+                logger.warning("SadCaptcha API: 배경 이미지가 data URI가 아님")
+                return False
+
+            # base64 추출
+            bg_b64 = bg_src.split(",", 1)[1]
+
+            piece_b64 = None
+            if piece_img_el:
+                piece_src = await piece_img_el.get_attribute("src")
+                if piece_src and piece_src.startswith("data:image"):
+                    piece_b64 = piece_src.split(",", 1)[1]
+
+            # SadCaptcha API 호출 (회전 퍼즐)
+            headers = {"api-key": self.sadcaptcha_api_key}
+            payload = {"puzzleImageB64": bg_b64}
+            if piece_b64:
+                payload["pieceImageB64"] = piece_b64
+
+            response = requests.post(
+                "https://www.sadcaptcha.com/api/v1/puzzle",
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+
+            if not response.ok:
+                logger.warning(f"SadCaptcha API 응답 오류: {response.status_code} {response.text[:200]}")
+                return False
+
+            data = response.json()
+            slide_x_proportion = data.get("slideXProportion") or data.get("slide_x_proportion")
+
+            if slide_x_proportion is None:
+                logger.warning(f"SadCaptcha API 응답에 slideXProportion 없음: {data}")
+                return False
+
+            logger.info(f"SadCaptcha API 결과: slideXProportion={slide_x_proportion:.4f}")
+
+            # 슬라이더 드래그 실행
+            slider_button = await self.page.query_selector(self.SLIDER_BUTTON_SEL)
+            slider_track = await self.page.query_selector(self.SLIDER_TRACK_SEL)
+
+            if not slider_button or not slider_track:
+                logger.warning("SadCaptcha API: 슬라이더 요소를 찾을 수 없음")
+                return False
+
+            track_box = await slider_track.bounding_box()
+            button_box = await slider_button.bounding_box()
+            if not track_box or not button_box:
+                return False
+
+            usable_width = track_box["width"] - button_box["width"]
+            drag_distance = int(usable_width * slide_x_proportion)
+            logger.info(f"SadCaptcha API: drag={drag_distance}px (usable={usable_width:.0f}px)")
+
+            await self._human_drag(slider_button, drag_distance)
+
+            # 서버 검증 대기
+            for wait_i in range(6):
+                await asyncio.sleep(1.5)
+                if not await self.is_captcha_visible():
+                    await asyncio.sleep(2)
+                    if not await self.is_captcha_visible():
+                        logger.info(f"SadCaptcha REST API: 캡차 풀기 성공! ({wait_i + 1}회차)")
+                        return True
+
+            logger.warning("SadCaptcha REST API: 드래그 후 캡차 여전히 표시됨")
+            return False
+
+        except Exception as e:
+            logger.warning(f"SadCaptcha REST API 오류: {e}")
+            return False
+
+    async def _solve_with_local_solver(self) -> bool:
+        """로컬 OpenCV/PIL 솔버로 캡차 풀기 (SadCaptcha 폴백)."""
+        self._jitter_offset = 0.0
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             if not await self.is_captcha_visible():
                 logger.info("캡차가 없음 - 통과")
                 return True
 
-            logger.info(f"캡차 풀기 시도 {attempt}/{self.MAX_RETRIES}")
+            logger.info(f"로컬 캡차 풀기 시도 {attempt}/{self.MAX_RETRIES}")
 
             try:
                 success = await self._attempt_solve()
@@ -86,7 +229,6 @@ class TikTokCaptchaSolver:
                     logger.info("캡차 풀기 실패 - 리프레시 후 재시도")
                     await self._refresh()
                     await asyncio.sleep(2)
-                    # 재시도마다 오프셋 변경
                     self._jitter_offset = random.uniform(-0.05, 0.05) * attempt
                     continue
 
@@ -104,7 +246,6 @@ class TikTokCaptchaSolver:
                 logger.info("드래그 후 캡차 여전히 표시 - 리프레시 후 재시도")
                 await self._refresh()
                 await asyncio.sleep(2)
-                # 재시도마다 오프셋 변경
                 self._jitter_offset = random.uniform(-0.05, 0.05) * attempt
 
             except Exception as e:

@@ -13,3 +13,4 @@ google-auth-oauthlib>=1.2.0
 Pillow>=10.0.0
 google-cloud-bigquery>=3.13.0
 google-api-python-client>=2.100.0
+tiktok-captcha-solver>=0.4.0

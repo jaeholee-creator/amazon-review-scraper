@@ -39,6 +39,7 @@ class TikTokShopScraper:
         headless: bool = True,
         gmail_imap_email: str = "",
         gmail_imap_app_password: str = "",
+        sadcaptcha_api_key: str = "",
     ):
         """
         Args:
@@ -48,6 +49,7 @@ class TikTokShopScraper:
             headless: 헤드리스 모드 여부
             gmail_imap_email: Gmail IMAP 이메일 주소 (인증 코드 자동 읽기용)
             gmail_imap_app_password: Gmail App Password (2FA 후 생성)
+            sadcaptcha_api_key: SadCaptcha API 키 (캡차 자동 풀기)
         """
         self.email = email
         self.password = password
@@ -55,6 +57,7 @@ class TikTokShopScraper:
         self.headless = headless
         self.gmail_imap_email = gmail_imap_email
         self.gmail_imap_app_password = gmail_imap_app_password
+        self.sadcaptcha_api_key = sadcaptcha_api_key
 
         self._playwright = None
         self._browser = None
@@ -662,7 +665,7 @@ class TikTokShopScraper:
         try:
             from utils.captcha_solver import TikTokCaptchaSolver
 
-            solver = TikTokCaptchaSolver(self._page)
+            solver = TikTokCaptchaSolver(self._page, sadcaptcha_api_key=self.sadcaptcha_api_key)
 
             if not await solver.is_captcha_visible():
                 logger.info("캡차 없음 - 통과")

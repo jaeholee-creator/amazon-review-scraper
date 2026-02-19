@@ -22,6 +22,7 @@ from config.settings import (
     TIKTOK_DATA_DIR,
     TIKTOK_GMAIL_IMAP_EMAIL,
     TIKTOK_GMAIL_IMAP_APP_PASSWORD,
+    SADCAPTCHA_API_KEY,
     get_tiktok_collection_date_range,
 )
 
@@ -130,6 +131,7 @@ async def scrape_tiktok_reviews() -> dict:
         headless=headless,
         gmail_imap_email=TIKTOK_GMAIL_IMAP_EMAIL,
         gmail_imap_app_password=TIKTOK_GMAIL_IMAP_APP_PASSWORD,
+        sadcaptcha_api_key=SADCAPTCHA_API_KEY,
     )
 
     try:
