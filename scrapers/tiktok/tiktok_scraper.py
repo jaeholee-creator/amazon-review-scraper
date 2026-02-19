@@ -96,9 +96,11 @@ class TikTokShopScraper:
             ),
             locale="en-US",
             timezone_id="America/New_York",
+            ignore_default_args=["--enable-automation"],
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
         self._browser = None  # persistent context는 browser 객체 없음
