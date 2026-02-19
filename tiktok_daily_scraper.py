@@ -41,6 +41,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def ensure_patchright_browser():
+    """Patchright Chromium 브라우저가 설치되어 있는지 확인하고, 없으면 설치"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "patchright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            logger.info("Patchright Chromium 브라우저 확인/설치 완료")
+        else:
+            logger.warning(f"Patchright 브라우저 설치 경고: {result.stderr[:200]}")
+    except Exception as e:
+        logger.warning(f"Patchright 브라우저 설치 확인 실패: {e}")
+
+
 def ensure_xvfb() -> bool:
     """
     Xvfb 가상 디스플레이 설정 (headless 환경에서 headed 브라우저 실행용).
@@ -197,12 +212,15 @@ async def main():
     logger.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
+    # Patchright Chromium 브라우저 설치 확인
+    ensure_patchright_browser()
+
     # Xvfb 가상 디스플레이 설정 (headed 모드로 캡차 우회)
     xvfb_available = ensure_xvfb()
     if xvfb_available:
-        logger.info("Xvfb 사용 가능 → headed 모드로 실행 (캡차 우회)")
+        logger.info("Xvfb 사용 가능 → headed 모드로 실행 (Patchright)")
     else:
-        logger.info("Xvfb 미사용 → headless + stealth 모드로 실행")
+        logger.info("Xvfb 미사용 → headless 모드로 실행 (Patchright)")
 
     start_date, end_date = get_tiktok_collection_date_range()
     date_str = f"{start_date} ~ {end_date}"
