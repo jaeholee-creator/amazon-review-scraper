@@ -420,8 +420,21 @@ class TikTokShopScraper:
 
             # 제출 후 대기
             await page.wait_for_timeout(5000)
-            logger.info(f"제출 후 URL: {page.url}")
+            submit_url = page.url
+            logger.info(f"제출 후 URL: {submit_url}")
             await page.screenshot(path=f"{self.data_dir}/debug_after_continue.png")
+
+            # Continue 클릭이 무시되었는지 확인 → 비밀번호 필드 Enter로 재시도
+            if "/account/login" in submit_url:
+                logger.info("Continue 클릭 효과 없음 → 비밀번호 필드에서 Enter 키 시도")
+                pw_locator = page.locator('input[type="password"]:visible').first
+                if await pw_locator.count() > 0:
+                    await pw_locator.click()
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(5000)
+                    logger.info(f"Enter 제출 후 URL: {page.url}")
+                    await page.screenshot(path=f"{self.data_dir}/debug_after_enter.png")
 
             # 에러 메시지 확인
             try:
@@ -679,37 +692,48 @@ class TikTokShopScraper:
     async def _human_type_field(self, locator, text: str, label: str) -> bool:
         """인간 유사 키보드 입력으로 필드에 텍스트를 입력.
 
-        TikTok의 행동 분석 우회를 위해:
-        1. 필드 클릭 → 짧은 대기
-        2. 기존 텍스트 선택 삭제
-        3. press_sequentially (80~200ms 랜덤 딜레이/키)
-        4. 입력값 검증
+        TikTok React 컴포넌트는 Playwright fill()이나 press_sequentially()의
+        CDP 이벤트로는 state가 업데이트되지 않을 수 있음.
+        page.keyboard.type()으로 브라우저 입력 파이프라인을 통한 키 이벤트 전달.
         """
         page = self._page
         try:
-            # 필드 클릭 (포커스)
+            # 방법 1: focus → keyboard.type (브라우저 입력 파이프라인 사용)
             await locator.click()
-            await page.wait_for_timeout(random.randint(200, 500))
+            await page.wait_for_timeout(random.randint(300, 700))
 
-            # 기존 텍스트 전체 선택 후 삭제
-            await page.keyboard.press("Control+a")
-            await page.wait_for_timeout(100)
-            await page.keyboard.press("Backspace")
-            await page.wait_for_timeout(random.randint(100, 300))
+            # 기존 값 클리어 (있다면)
+            current_val = await locator.input_value()
+            if current_val:
+                await page.keyboard.press("Control+a")
+                await page.wait_for_timeout(100)
+                await page.keyboard.press("Backspace")
+                await page.wait_for_timeout(200)
 
-            # 글자별 입력 (랜덤 딜레이)
+            # keyboard.type으로 글자별 입력 (랜덤 딜레이)
             delay = random.randint(80, 150)
-            await locator.press_sequentially(text, delay=delay)
-            await page.wait_for_timeout(random.randint(200, 500))
+            await page.keyboard.type(text, delay=delay)
+            await page.wait_for_timeout(random.randint(300, 600))
 
-            # 입력값 검증
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} 입력 성공 (press_sequentially, delay={delay}ms)")
+                logger.info(f"{label} 입력 성공 (keyboard.type, delay={delay}ms)")
                 return True
 
-            # fallback: fill() 시도
-            logger.warning(f"{label} press_sequentially 후 값 불일치 '{val}' → fill() 시도")
+            # 방법 2: triple-click + keyboard.type
+            logger.info(f"{label} keyboard.type 후 '{val[:20]}' - triple-click 재시도")
+            await locator.click(click_count=3)
+            await page.wait_for_timeout(200)
+            await page.keyboard.type(text, delay=random.randint(60, 120))
+            await page.wait_for_timeout(300)
+
+            val = await locator.input_value()
+            if val == text:
+                logger.info(f"{label} 입력 성공 (triple-click + type)")
+                return True
+
+            # 방법 3: fill() - 최후 수단 (봇 감지 위험 있으나 입력은 됨)
+            logger.warning(f"{label} keyboard.type 실패 '{val[:20]}' → fill() 시도")
             await locator.fill(text)
             await page.wait_for_timeout(300)
             val = await locator.input_value()
@@ -717,7 +741,7 @@ class TikTokShopScraper:
                 logger.info(f"{label} fill() 폴백 성공")
                 return True
 
-            logger.error(f"{label} 입력 실패: '{val}'")
+            logger.error(f"{label} 입력 실패: '{val[:20]}'")
             return False
         except Exception as e:
             logger.error(f"{label} 입력 오류: {e}")
