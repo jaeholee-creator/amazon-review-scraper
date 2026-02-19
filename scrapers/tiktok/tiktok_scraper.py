@@ -1,5 +1,8 @@
 """
-TikTok Shop Seller Center Review Scraper - Playwright 기반 HTML 파싱
+TikTok Shop Seller Center Review Scraper - Patchright 기반 HTML 파싱
+
+Patchright: Chromium 바이너리 레벨에서 자동화 마커를 제거하는 Playwright 포크.
+playwright-stealth 등 JS 레벨 패치 불필요.
 """
 import asyncio
 import hashlib
@@ -12,13 +15,13 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, Page, BrowserContext
+from patchright.async_api import async_playwright, Page, BrowserContext
 
 logger = logging.getLogger(__name__)
 
 
 class TikTokShopScraper:
-    """TikTok Shop Seller Center에서 리뷰를 수집하는 Playwright 기반 스크래퍼"""
+    """TikTok Shop Seller Center에서 리뷰를 수집하는 Patchright 기반 스크래퍼"""
 
     SELLER_CENTER_URL = "https://seller-us.tiktok.com"
     RATING_PAGE_URL = "https://seller-us.tiktok.com/product/rating?shop_region=US"
@@ -66,8 +69,8 @@ class TikTokShopScraper:
     # =========================================================================
 
     async def start(self) -> bool:
-        """Playwright 브라우저 시작 및 로그인"""
-        logger.info("Playwright 브라우저 시작...")
+        """Patchright 브라우저 시작 및 로그인"""
+        logger.info("Patchright 브라우저 시작...")
 
         self._playwright = await async_playwright().start()
 
@@ -94,84 +97,28 @@ class TikTokShopScraper:
             locale="en-US",
             timezone_id="America/New_York",
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
-            ignore_default_args=["--enable-automation"],
         )
         self._browser = None  # persistent context는 browser 객체 없음
 
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
-        # playwright-stealth 적용 (봇 탐지 우회)
-        try:
-            # v2.x API: Stealth 클래스 사용
-            from playwright_stealth import Stealth
-            stealth = Stealth()
-            await stealth.apply_stealth_async(self._page)
-            logger.info("playwright-stealth v2 적용 완료")
-        except (ImportError, AttributeError):
-            try:
-                # v1.x API: stealth_async 함수 사용
-                from playwright_stealth import stealth_async
-                await stealth_async(self._page)
-                logger.info("playwright-stealth v1 적용 완료")
-            except ImportError:
-                logger.warning("playwright-stealth 미설치 - 수동 스텔스 적용")
-                await self._apply_manual_stealth()
+        # Patchright는 Chromium 바이너리 레벨에서 자동화 마커를 제거하므로
+        # playwright-stealth, 수동 stealth, CDP 흔적 제거 등이 불필요
 
-        # 추가 CDP 흔적 제거 (stealth가 커버하지 못하는 영역)
-        await self._context.add_init_script("""
-            // CDP Runtime.enable 흔적 제거
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-            // permissions.query 오버라이드 (headless 탐지 방지)
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-            );
-
-            // WebGL vendor/renderer spoofing
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return getParameter.call(this, parameter);
-            };
-        """)
+        # JSON 쿠키 복원 (영구 프로필 보완)
+        await self._restore_cookies()
 
         # 로그인 시도
         logged_in = await self._ensure_logged_in()
-        return logged_in
 
-    async def _apply_manual_stealth(self):
-        """playwright-stealth 미설치 시 수동 스텔스 적용 (폴백)"""
-        await self._context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = {
-                runtime: { onConnect: { addListener: function() {} } },
-                loadTimes: function() { return {} },
-                csi: function() { return {} },
-            };
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [
-                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
-                ]
-            });
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en']
-            });
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-        """)
+        # 로그인 성공 시 쿠키 백업
+        if logged_in:
+            await self._save_cookies()
+
+        return logged_in
 
     async def close(self):
         """브라우저 종료"""
@@ -190,15 +137,55 @@ class TikTokShopScraper:
     # =========================================================================
     # Cookie / Session Management
     # =========================================================================
-    # 영구 브라우저 프로필 사용 → 쿠키/localStorage/sessionStorage 자동 유지
-    # 별도 쿠키 파일 저장 불필요
+
+    @property
+    def _cookie_file(self) -> str:
+        return os.path.join(self.data_dir, "cookies.json")
+
+    async def _save_cookies(self):
+        """현재 브라우저 쿠키를 JSON 파일로 백업"""
+        try:
+            cookies = await self._context.cookies()
+            with open(self._cookie_file, "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            logger.info(f"쿠키 백업 완료: {len(cookies)}개 → {self._cookie_file}")
+        except Exception as e:
+            logger.warning(f"쿠키 백업 실패: {e}")
+
+    async def _restore_cookies(self) -> bool:
+        """JSON 백업에서 쿠키 복원 (영구 프로필 보완)"""
+        try:
+            if not os.path.exists(self._cookie_file):
+                logger.info("쿠키 백업 파일 없음 - 건너뜀")
+                return False
+
+            # 파일 수정 시간 확인: 7일 이상 된 쿠키는 무시
+            mtime = os.path.getmtime(self._cookie_file)
+            age_days = (time.time() - mtime) / 86400
+            if age_days > 7:
+                logger.info(f"쿠키 백업이 {age_days:.1f}일 전 - 만료됨, 건너뜀")
+                return False
+
+            with open(self._cookie_file, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+
+            if not cookies:
+                return False
+
+            await self._context.add_cookies(cookies)
+            logger.info(f"쿠키 복원 완료: {len(cookies)}개 ({age_days:.1f}일 전 백업)")
+            return True
+
+        except Exception as e:
+            logger.warning(f"쿠키 복원 실패: {e}")
+            return False
 
     # =========================================================================
     # Login
     # =========================================================================
 
     async def _ensure_logged_in(self) -> bool:
-        """로그인 상태 확인 및 필요시 로그인 수행 (최대 2회 시도)"""
+        """로그인 상태 확인 및 필요시 로그인 수행 (최대 3회, 지수 백오프)"""
         page = self._page
 
         # Rating 페이지로 이동하여 세션 확인
@@ -219,17 +206,21 @@ class TikTokShopScraper:
 
         logger.info("세션 만료. 재로그인 진행...")
 
-        # 최대 2회 로그인 시도
-        for attempt in range(1, 3):
-            logger.info(f"로그인 시도 {attempt}/2")
+        # 최대 3회 로그인 시도 (지수 백오프: 5초, 10초, 20초)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"로그인 시도 {attempt}/{max_attempts}")
             success = await self._do_login()
             if success:
+                # 로그인 성공 시 쿠키 백업
+                await self._save_cookies()
                 return True
-            if attempt < 2:
-                logger.info("로그인 실패 - 5초 후 재시도")
-                await page.wait_for_timeout(5000)
+            if attempt < max_attempts:
+                backoff = 5 * (2 ** (attempt - 1))  # 5초, 10초
+                logger.info(f"로그인 실패 - {backoff}초 후 재시도")
+                await page.wait_for_timeout(backoff * 1000)
 
-        # 2회 모두 실패 시 Slack 알림
+        # 모든 시도 실패 시 Slack 알림
         self._notify_captcha_failure()
         return False
 
