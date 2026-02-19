@@ -199,6 +199,11 @@ class TikTokShopScraper:
             if await self._is_logged_in():
                 logger.info("기존 세션으로 로그인 확인됨 (캡차/로그인 건너뜀)")
                 await self._dismiss_popups()
+                # 팝업 닫기 후 TikTok이 세션을 만료시킬 수 있으므로 URL 재확인
+                post_url = page.url
+                if "/account/login" in post_url or "/account/register" in post_url:
+                    logger.warning(f"팝업 처리 후 세션 만료 감지. URL: {post_url}")
+                    break  # 재로그인 플로우로 전환
                 return True
             current_url = page.url
             if "/account/login" in current_url or "/account/register" in current_url:
@@ -271,13 +276,20 @@ class TikTokShopScraper:
         if seller_indicators:
             return True
 
-        # URL 패턴 기반 판단
+        # URL 패턴 기반 판단 (지연된 리다이렉트 방지를 위해 재확인)
         if "seller-us.tiktok.com" in current_url:
             logged_in_paths = ["/homepage", "/product/", "/order/", "/dashboard", "/finance/"]
             for path in logged_in_paths:
                 if path in current_url:
-                    # URL이 내부 경로에 매칭 + 로그인 폼/공개 시그널 없음 → 로그인 상태
-                    logger.info(f"URL 매칭으로 로그인 확인: {current_url[:80]}")
+                    # TikTok은 비인증 상태에서도 내부 URL을 잠시 유지한 뒤
+                    # JS 비동기로 register 페이지로 리다이렉트할 수 있음.
+                    # 3초 대기 후 URL을 재확인하여 false positive 방지.
+                    await page.wait_for_timeout(3000)
+                    rechecked_url = page.url
+                    if "/account/login" in rechecked_url or "/account/register" in rechecked_url:
+                        logger.info(f"URL 재확인: 세션 만료 감지 → 미로그인. URL: {rechecked_url[:80]}")
+                        return False
+                    logger.info(f"URL 매칭으로 로그인 확인: {rechecked_url[:80]}")
                     return True
 
         return False
@@ -727,6 +739,29 @@ class TikTokShopScraper:
             logger.warning(f"캡차 처리 중 오류: {e}")
             return True
 
+    async def _recover_session(self) -> bool:
+        """세션 만료 시 재로그인을 시도하여 세션 복구.
+
+        Returns:
+            True if session was recovered successfully
+        """
+        logger.info("세션 복구 시도: 재로그인 진행...")
+        page = self._page
+
+        success = await self._do_login()
+        if success:
+            await self._save_cookies()
+            # Rating 페이지로 복귀
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            if await self._is_logged_in():
+                logger.info("세션 복구 성공")
+                return True
+
+        logger.error("세션 복구 실패: 재로그인 불가")
+        self._notify_captcha_failure()
+        return False
+
     async def _dismiss_popups(self):
         """공지사항, 알림, 모달 등의 팝업을 안전하게 닫기.
 
@@ -996,15 +1031,17 @@ class TikTokShopScraper:
         # 공지사항/알림 팝업 닫기 (안전한 셀렉터만 사용)
         await self._dismiss_popups()
 
-        # 팝업 처리 후 URL 변경 감지 → 재이동
+        # 팝업 처리 후 URL 변경 감지 → 세션 복구 시도
         current_url = page.url
         if "/product/rating" not in current_url:
             if "/account/login" in current_url or "/account/register" in current_url:
-                logger.error(f"팝업 처리 후 세션 만료. URL: {current_url}")
-                return all_reviews
-            logger.warning(f"Rating 페이지 이탈 감지. 재이동. URL: {current_url}")
-            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
+                logger.warning(f"팝업 처리 후 세션 만료 감지. 재로그인 시도. URL: {current_url}")
+                if not await self._recover_session():
+                    return all_reviews
+            else:
+                logger.warning(f"Rating 페이지 이탈 감지. 재이동. URL: {current_url}")
+                await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(3000)
 
         # Rating 페이지에서도 캡차가 나올 수 있음
         await self._handle_captcha()
@@ -1012,17 +1049,19 @@ class TikTokShopScraper:
         # 캡차 처리 후에도 URL 변경 감지
         current_url = page.url
         if "/account/login" in current_url or "/account/register" in current_url:
-            logger.error(f"캡차 처리 후 세션 만료. URL: {current_url}")
-            return all_reviews
-        if "/product/rating" not in current_url:
+            logger.warning(f"캡차 처리 후 세션 만료. 재로그인 시도. URL: {current_url}")
+            if not await self._recover_session():
+                return all_reviews
+        elif "/product/rating" not in current_url:
             logger.warning(f"캡차 후 Rating 이탈. 재이동. URL: {current_url}")
             await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
         # 최종 로그인 상태 확인
         if not await self._is_logged_in():
-            logger.error(f"세션 만료. URL: {page.url}")
-            return all_reviews
+            logger.warning(f"최종 로그인 확인 실패. 재로그인 시도. URL: {page.url}")
+            if not await self._recover_session():
+                return all_reviews
 
         for page_num in range(1, max_pages + 1):
             try:
