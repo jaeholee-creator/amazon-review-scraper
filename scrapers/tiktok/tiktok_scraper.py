@@ -643,7 +643,18 @@ class TikTokShopScraper:
                 logger.info(f"로그인 버튼 클릭: {selector}")
                 return True
 
-        # 방법 2: Enter 키
+        # 방법 2: JavaScript 강제 클릭 (이벤트 차단 우회)
+        for selector in [
+            'button:has-text("Continue")',
+            'button[type="submit"]',
+        ]:
+            btn = await page.query_selector(selector)
+            if btn:
+                await btn.evaluate("el => el.click()")
+                logger.info(f"로그인 버튼 JS 강제 클릭: {selector}")
+                return True
+
+        # 방법 3: Enter 키
         logger.info("로그인 버튼을 찾지 못함 - Enter 키로 시도")
         await page.keyboard.press("Enter")
         return True
@@ -738,13 +749,31 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (triple-click + type)")
                 return True
 
-            # 방법 3: fill() - 최후 수단 (봇 감지 위험 있으나 입력은 됨)
-            logger.warning(f"{label} keyboard.type 실패 '{val[:20]}' → fill() 시도")
+            # 방법 3: fill() + React 이벤트 강제 발생
+            logger.warning(f"{label} keyboard.type 실패 '{val[:20]}' → fill()+React event 시도")
             await locator.fill(text)
+            await page.wait_for_timeout(200)
+            # React controlled input: native setter + synthetic events로 React state 동기화
+            await locator.evaluate("""
+                (el, val) => {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, val);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    const reactKey = Object.keys(el).find(
+                        k => k.startsWith('__reactFiber$') || k.startsWith('__reactProps$'));
+                    if (reactKey) {
+                        const fiber = el[reactKey];
+                        if (fiber && fiber.memoizedProps && fiber.memoizedProps.onChange)
+                            fiber.memoizedProps.onChange({ target: el });
+                    }
+                }
+            """, text)
             await page.wait_for_timeout(300)
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} fill() 폴백 성공")
+                logger.info(f"{label} fill()+React event 성공")
                 return True
 
             logger.error(f"{label} 입력 실패: '{val[:20]}'")
