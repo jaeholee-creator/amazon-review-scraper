@@ -83,20 +83,38 @@ class BrowserSession:
     # =========================================================================
 
     async def start(self):
-        """Playwright Firefox 시작 + 단일 Page 생성."""
-        self._playwright = await async_playwright().start()
+        """Playwright Chromium 시작 + 단일 Page 생성."""
+        # Patchright 우선 시도: 봇 감지 우회 (자동화 마커 바이너리 레벨 제거)
+        # Amazon은 HeadlessChrome UA와 navigator.webdriver=true를 감지하므로
+        # Patchright로 이를 바이너리 레벨에서 제거
+        try:
+            from patchright.async_api import async_playwright as patchright_playwright
+            self._playwright = await patchright_playwright().start()
+            print(f"   Browser started (Patchright, {self._region.upper()})")
+        except ImportError:
+            self._playwright = await async_playwright().start()
+            print(f"   Browser started (Playwright, {self._region.upper()})")
+
         self._browser = await self._playwright.chromium.launch(
             headless=True,
-            args=['--disable-dev-shm-usage', '--no-sandbox'],
+            args=[
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled',
+            ],
         )
         self._context = await self._browser.new_context(
             viewport={'width': 1920, 'height': 1080},
             locale=self._locale,
             timezone_id=self._timezone,
+            user_agent=(
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/133.0.0.0 Safari/537.36'
+            ),
         )
         self._page = await self._context.new_page()  # 유일한 new_page()
         self._page.on('request', self._on_request)   # 1회만 등록
-        print(f"   Browser started (Chromium, {self._region.upper()}, single page)")
 
     async def close(self):
         """브라우저 리소스 정리."""
