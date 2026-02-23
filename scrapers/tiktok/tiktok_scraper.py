@@ -164,10 +164,11 @@ class TikTokShopScraper:
                 logger.info("쿠키 백업 파일 없음 - 건너뜀")
                 return False
 
-            # 파일 수정 시간 확인: 7일 이상 된 쿠키는 무시
+            # 파일 수정 시간 확인: 30일 이상 된 쿠키는 무시
+            # (heartbeat가 매일 실행되면 쿠키는 항상 fresh하므로 실제로 이 조건에 걸리는 경우는 드묾)
             mtime = os.path.getmtime(self._cookie_file)
             age_days = (time.time() - mtime) / 86400
-            if age_days > 7:
+            if age_days > 30:
                 logger.info(f"쿠키 백업이 {age_days:.1f}일 전 - 만료됨, 건너뜀")
                 return False
 
