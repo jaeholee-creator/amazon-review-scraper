@@ -46,7 +46,6 @@ def scrape_shopee_country(country_code: str) -> dict:
         logger.error(f"Unknown country code: {country_code}")
         return {}
 
-    # 날짜 범위 설정
     start_date, end_date = get_shopee_collection_date_range()
 
     logger.info(f"=" * 80)
@@ -54,14 +53,12 @@ def scrape_shopee_country(country_code: str) -> dict:
     logger.info(f"날짜 범위: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
     logger.info(f"=" * 80)
 
-    # 스크래퍼 초기화
     scraper = ShopeeScraper(
         country=shop_config['country'],
         userid=shop_config['userid'],
         shopid=shop_config['shopid']
     )
 
-    # 스크래핑 실행
     try:
         result = scraper.scrape(start_date, end_date)
         logger.info(f"[{country_code.upper()}] 수집 완료: {result['total_reviews']}개 리뷰")
@@ -89,14 +86,13 @@ def _publish_to_bigquery(country_code: str, result: dict) -> dict:
     try:
         from publishers.bigquery_publisher import BigQueryPublisher
         publisher = BigQueryPublisher(
-            project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
-            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+            project_id=os.environ.get('GCP_PROJECT_ID', 'member-378109'),
+            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'jaeho'),
             table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
             credentials_file='config/bigquery-service-account.json',
         )
 
         reviews = result.get('reviews', [])
-        # platform_country = 마켓플레이스 국가, author_country = NULL (Shopee는 리뷰어 국가 미제공)
         for r in reviews:
             r['platform_country'] = country_code.upper()
             r['author_country'] = None
@@ -177,7 +173,6 @@ def main():
 
     elapsed = time.time() - start_time
 
-    # 최종 요약
     logger.info("\n" + "=" * 80)
     logger.info("최종 요약")
     logger.info("=" * 80)
@@ -199,7 +194,6 @@ def main():
         from src.slack_notifier import SlackNotifier
         slack = SlackNotifier()
 
-        # Shopee: 국가별로 제품 수와 리뷰 수 표시
         slack_results = []
         for country, data in results.items():
             scrape_data = data.get('scrape', {})
