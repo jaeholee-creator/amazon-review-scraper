@@ -40,8 +40,8 @@ class BigQueryPublisher:
 
     def __init__(
         self,
-        project_id: str = "ax-test-jaeho",
-        dataset_id: str = "ax_cs",
+        project_id: str = "member-378109",
+        dataset_id: str = "jaeho",
         table_id: str = "platform_reviews",
         credentials_file: str = "config/bigquery-service-account.json",
     ):
@@ -314,14 +314,11 @@ def _normalize_country(value: Any, platform: str) -> Optional[str]:
     s = _to_str(value)
     if s:
         s = s.strip()
-        # 정확한 매핑이 있으면 사용
         if s in _COUNTRY_NORMALIZE:
             return _COUNTRY_NORMALIZE[s]
-        # 대소문자 무시하고 한번 더 시도
         for key, code in _COUNTRY_NORMALIZE.items():
             if key.lower() == s.lower():
                 return code
-        # 이미 2자리 ISO 코드인 경우 대문자로 반환
         if len(s) == 2 and s.isalpha():
             return s.upper()
         return s
@@ -367,24 +364,19 @@ def _to_date_str(value: Any) -> Optional[str]:
     if value is None or value == "":
         return None
 
-    # datetime 객체 직접 처리
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
-    if hasattr(value, 'isoformat'):  # date 객체
+    if hasattr(value, 'isoformat'):
         return str(value)
 
     s = str(value).strip()
 
-    # 이미 YYYY-MM-DD 형식이면 그대로
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         return s
-    # YYYY-MM-DDTHH:MM:SS 형식이면 날짜만 추출
     if "T" in s:
         return s[:10]
-    # "YYYY-MM-DD HH:MM:SS" 형식 (공백 구분) → 날짜만 추출
     if len(s) > 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
-    # MM/DD/YYYY 형식
     if "/" in s:
         parts = s.split("/")
         if len(parts) == 3:
@@ -392,13 +384,11 @@ def _to_date_str(value: Any) -> Optional[str]:
                 return f"{parts[2]}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
             except (ValueError, IndexError):
                 pass
-    # 영문 날짜: "February 11, 2026", "January 1, 2025" 등
     try:
         parsed = datetime.strptime(s, "%B %d, %Y")
         return parsed.strftime("%Y-%m-%d")
     except ValueError:
         pass
-    # Unix timestamp (10자리 정수)
     if s.isdigit() and len(s) >= 9:
         try:
             return datetime.fromtimestamp(int(s)).strftime("%Y-%m-%d")
@@ -416,29 +406,20 @@ def _format_urls(value: Any) -> Optional[str]:
 
 
 def _to_timestamp(value: Any) -> Optional[str]:
-    """다양한 타임스탬프 형식을 BigQuery TIMESTAMP 형식으로 변환
-
-    BigQuery 요구 형식: YYYY-MM-DD HH:MM:SS 또는 ISO 8601
-    문제: Google Sheets에서 '2026-02-12 5:18:35' (시간 패딩 없음) 형식이 올 수 있음
-    """
+    """다양한 타임스탬프 형식을 BigQuery TIMESTAMP 형식으로 변환"""
     if value is None or value == "":
         return None
     s = str(value).strip()
 
-    # ISO 8601 형식이면 그대로
     if "T" in s:
         return s
 
-    # 'YYYY-MM-DD H:MM:SS' → 'YYYY-MM-DD HH:MM:SS' 변환
     if " " in s:
         parts = s.split(" ", 1)
         date_part = parts[0]
         time_part = parts[1] if len(parts) > 1 else "00:00:00"
-
-        # 시간 파트의 각 요소를 2자리로 패딩
         time_components = time_part.split(":")
         padded_time = ":".join(c.zfill(2) for c in time_components)
-
         return f"{date_part} {padded_time}"
 
     return s
