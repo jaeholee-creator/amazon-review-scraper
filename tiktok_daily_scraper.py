@@ -65,20 +65,16 @@ def ensure_xvfb() -> bool:
     Returns:
         True if DISPLAY is available (either existing or newly started)
     """
-    # 이미 DISPLAY가 설정되어 있으면 (데스크탑 환경 또는 이미 Xvfb 실행중)
     if os.environ.get("DISPLAY"):
         logger.info(f"DISPLAY 이미 설정됨: {os.environ['DISPLAY']}")
         return True
 
-    # Xvfb가 설치되어 있는지 확인
     if not shutil.which("Xvfb"):
         logger.info("Xvfb 미설치 - headless 모드로 실행")
         return False
 
-    # Xvfb 시작 (디스플레이 :99)
     display_num = ":99"
     try:
-        # 기존 Xvfb 프로세스 확인
         result = subprocess.run(
             ["pgrep", "-f", f"Xvfb {display_num}"],
             capture_output=True, text=True
@@ -88,7 +84,6 @@ def ensure_xvfb() -> bool:
             os.environ["DISPLAY"] = display_num
             return True
 
-        # Xvfb 시작
         subprocess.Popen(
             ["Xvfb", display_num, "-screen", "0", "1920x1080x24", "-ac"],
             stdout=subprocess.DEVNULL,
@@ -97,7 +92,6 @@ def ensure_xvfb() -> bool:
         os.environ["DISPLAY"] = display_num
         logger.info(f"Xvfb 시작 완료 (DISPLAY={display_num})")
 
-        # Xvfb 안정화 대기
         import time
         time.sleep(1)
         return True
@@ -108,12 +102,7 @@ def ensure_xvfb() -> bool:
 
 
 async def scrape_tiktok_reviews() -> dict:
-    """
-    TikTok Shop 리뷰 수집
-
-    Returns:
-        스크래핑 결과 dict
-    """
+    """TikTok Shop 리뷰 수집"""
     start_date, end_date = get_tiktok_collection_date_range()
 
     logger.info("=" * 80)
@@ -121,7 +110,6 @@ async def scrape_tiktok_reviews() -> dict:
     logger.info(f"날짜 범위: {start_date} ~ {end_date}")
     logger.info("=" * 80)
 
-    # headless 모드: 환경변수로 제어 (CI에서는 headless, 로컬에서는 headed 가능)
     headless = os.environ.get("TIKTOK_HEADLESS", "true").lower() == "true"
 
     scraper = TikTokShopScraper(
@@ -161,14 +149,13 @@ def _publish_to_bigquery(result: dict) -> dict:
     try:
         from publishers.bigquery_publisher import BigQueryPublisher
         publisher = BigQueryPublisher(
-            project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
-            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+            project_id=os.environ.get('GCP_PROJECT_ID', 'member-378109'),
+            dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'jaeho'),
             table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
             credentials_file='config/bigquery-service-account.json',
         )
 
         reviews = result.get('reviews', [])
-        # platform_country 설정 (환경변수로 확장 가능)
         tiktok_country = os.environ.get('TIKTOK_PLATFORM_COUNTRY', 'US')
         for r in reviews:
             r['platform_country'] = tiktok_country
@@ -214,10 +201,8 @@ async def main():
     logger.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
-    # Patchright Chromium 브라우저 설치 확인
     ensure_patchright_browser()
 
-    # Xvfb 가상 디스플레이 설정 (headed 모드로 캡차 우회)
     xvfb_available = ensure_xvfb()
     if xvfb_available:
         logger.info("Xvfb 사용 가능 → headed 모드로 실행 (Patchright)")
@@ -227,10 +212,8 @@ async def main():
     start_date, end_date = get_tiktok_collection_date_range()
     date_str = f"{start_date} ~ {end_date}"
 
-    # 1. 리뷰 수집
     scrape_result = await scrape_tiktok_reviews()
 
-    # 2. 데이터 업로드 (BigQuery 또는 Google Sheets)
     publish_result = {}
     if scrape_result.get("status") == "success":
         publish_result = publish_reviews(scrape_result)
@@ -239,7 +222,6 @@ async def main():
 
     elapsed = time.time() - start_time
 
-    # 3. 최종 요약
     total_reviews = scrape_result.get("total_reviews", 0)
     appended = publish_result.get("appended_reviews", 0)
     status = scrape_result.get("status", "unknown")
@@ -254,7 +236,6 @@ async def main():
     logger.info("TikTok Shop Daily Review Scraper 완료")
     logger.info("=" * 80)
 
-    # 4. Slack 알림
     try:
         from src.slack_notifier import SlackNotifier
         slack = SlackNotifier()
@@ -285,7 +266,6 @@ async def main():
 if __name__ == "__main__":
     try:
         result = asyncio.run(main())
-        # 스크래핑 실패 시 non-zero exit code로 Airflow에 실패 전파
         scrape_status = result.get("scrape", {}).get("status", "unknown")
         if scrape_status != "success":
             logger.error(f"스크래핑 실패 (status={scrape_status}) - exit code 1")
