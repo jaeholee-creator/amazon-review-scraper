@@ -127,8 +127,8 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
         try:
             from publishers.bigquery_publisher import BigQueryPublisher
             bq_publisher = BigQueryPublisher(
-                project_id=os.environ.get('GCP_PROJECT_ID', 'ax-test-jaeho'),
-                dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'ax_cs'),
+                project_id=os.environ.get('GCP_PROJECT_ID', 'member-378109'),
+                dataset_id=os.environ.get('BIGQUERY_DATASET_ID', 'jaeho'),
                 table_id=os.environ.get('BIGQUERY_TABLE_ID', 'platform_reviews'),
                 credentials_file='config/bigquery-service-account.json',
             )
@@ -187,12 +187,10 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
             print(f"\n{'—'*60}")
             print(f"[{i}/{len(asin_list)}] {name} ({asin})")
 
-            # HTML 크롤링으로 리뷰 수집
             reviews, status, error_msg = await session.scrape_reviews_html(
                 asin, start_date, end_date, collected_ids, max_pages,
             )
 
-            # ID 트래킹 (메모리에서만 관리)
             new_ids = {r['review_id'] for r in reviews if r.get('review_id')}
             collected_ids.update(new_ids)
 
@@ -207,7 +205,6 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
                 'error_message': error_msg,
             })
 
-            # 제품 간 대기
             if i < len(asin_list):
                 delay = random.uniform(cfg['min_delay'], cfg['max_delay'])
                 await asyncio.sleep(delay)
@@ -249,8 +246,6 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
         print("\n[Step 5] Publishing to BigQuery...")
         try:
             if all_reviews:
-                # Amazon 스크래퍼 키 → BigQuery 스키마 키 매핑
-                # product_name은 results 레벨에 있으므로 review에 포함
                 product_name_map = {r['asin']: r['product_name'] for r in results}
                 mapped_reviews = []
                 for r in all_reviews:
