@@ -81,6 +81,16 @@ class TikTokShopScraper:
         profile_dir = os.path.join(self.data_dir, "browser_profile")
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
+        # 이전 세션의 잠금 파일 제거 (브라우저 크래시/강제종료 후 잔재)
+        for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
+            lock_path = os.path.join(profile_dir, lock_name)
+            if os.path.exists(lock_path):
+                try:
+                    os.remove(lock_path)
+                    logger.info(f"잠금 파일 제거: {lock_name}")
+                except Exception:
+                    pass
+
         # headless 모드 결정: DISPLAY 환경변수가 있으면 headed(Xvfb) 사용
         use_headless = self.headless
         display = os.environ.get("DISPLAY", "")
@@ -88,8 +98,7 @@ class TikTokShopScraper:
             logger.info(f"DISPLAY={display} 감지 → Xvfb headed 모드로 전환")
             use_headless = False
 
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            profile_dir,
+        launch_kwargs = dict(
             headless=use_headless,
             viewport={"width": 1440, "height": 900},
             user_agent=(
@@ -102,10 +111,41 @@ class TikTokShopScraper:
             ignore_default_args=["--enable-automation"],
             args=[
                 "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-features=VizDisplayCompositor",
+                "--disable-extensions",
+                "--no-first-run",
+                "--no-restore-session-state",
+                "--no-default-browser-check",
                 "--disable-blink-features=AutomationControlled",
             ],
         )
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                profile_dir, **launch_kwargs,
+            )
+        except Exception as e:
+            logger.warning(f"launch_persistent_context 실패: {e}")
+            logger.warning("잠금 파일 재정리 후 재시도...")
+            import glob
+            for lock in glob.glob(os.path.join(profile_dir, "*.lock")):
+                try:
+                    os.remove(lock)
+                except Exception:
+                    pass
+            for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
+                lock_path = os.path.join(profile_dir, lock_name)
+                if os.path.exists(lock_path):
+                    try:
+                        os.remove(lock_path)
+                    except Exception:
+                        pass
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                profile_dir, **launch_kwargs,
+            )
         self._browser = None  # persistent context는 browser 객체 없음
 
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -194,14 +234,35 @@ class TikTokShopScraper:
         """로그인 상태 확인 및 필요시 로그인 수행 (최대 3회, 지수 백오프)"""
         page = self._page
 
-        # Rating 페이지로 이동하여 세션 확인
-        logger.info("Seller Center 접속 시도...")
-        await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+        # Homepage 먼저 방문하여 세션 워밍업 (tt_ticket_guard 토큰 활성화)
+        # /product/rating은 tt_ticket_guard 검증이 엄격하여 직접 접속 시
+        # ttp_session_expire 발생. homepage를 먼저 방문하면 guard 토큰이 활성화됨.
+        logger.info("Homepage 워밍업 시작...")
+        try:
+            await page.goto(
+                self.SELLER_CENTER_URL + "/homepage",
+                wait_until="domcontentloaded", timeout=30000
+            )
+            await page.wait_for_timeout(8000)
+            warmup_url = page.url
+            if "/account/login" not in warmup_url and "/account/register" not in warmup_url:
+                logger.info(f"Homepage 워밍업 성공: {warmup_url[:80]}")
+            else:
+                logger.info(f"Homepage 워밍업: 세션 만료 감지. URL: {warmup_url[:80]}")
+        except Exception as e:
+            logger.warning(f"Homepage 워밍업 실패: {e}")
 
-        # SSO 리다이렉트 완료 대기
+        # Rating 페이지로 이동하여 세션 확인
+        logger.info("Rating 페이지 접속 시도...")
+        try:
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            logger.warning(f"Rating 페이지 이동 중 네비게이션: {e}")
+
+        # SSO 리다이렉트 완료 대기 (5초: TikTok guard가 6-8초에 재검증하여 세션 만료를 유발할 수 있음)
         await page.wait_for_timeout(5000)
         for _ in range(4):
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(3000)
             if await self._is_logged_in():
                 logger.info("기존 세션으로 로그인 확인됨 (캡차/로그인 건너뜀)")
                 await self._dismiss_popups()
@@ -251,7 +312,7 @@ class TikTokShopScraper:
 
         # 페이지 콘텐츠 기반 확인 (공개 페이지 vs 인증 페이지 구분)
         try:
-            body_text = await page.evaluate("() => document.body.innerText.substring(0, 1000)")
+            body_text = await page.evaluate("() => (document.body?.innerText || '').substring(0, 1000)")
 
             # 공개 마케팅 페이지 감지 (복수 시그널)
             public_signals = ["Join now", "Sign up", "Get $", "New Seller Rewards"]
@@ -268,19 +329,25 @@ class TikTokShopScraper:
             pass
 
         # 비밀번호 입력창이 있으면 미로그인
-        password_input = await page.query_selector('input[type="password"]')
-        if password_input:
-            return False
+        try:
+            password_input = await page.query_selector('input[type="password"]')
+            if password_input:
+                return False
+        except Exception:
+            pass
 
         # Seller Center 인증 요소 확인 (사이드바 네비게이션 등)
         # 이것이 있으면 확실히 로그인 상태
-        seller_indicators = await page.query_selector(
-            '[class*="sidebar"], [class*="Sidebar"], '
-            '[class*="navigation"], [class*="Navigation"], '
-            '[class*="shopName"], [class*="ShopName"]'
-        )
-        if seller_indicators:
-            return True
+        try:
+            seller_indicators = await page.query_selector(
+                '[class*="sidebar"], [class*="Sidebar"], '
+                '[class*="navigation"], [class*="Navigation"], '
+                '[class*="shopName"], [class*="ShopName"]'
+            )
+            if seller_indicators:
+                return True
+        except Exception:
+            pass
 
         # URL 패턴 기반 판단 (지연된 리다이렉트 방지를 위해 재확인)
         if "seller-us.tiktok.com" in current_url:
@@ -594,7 +661,8 @@ class TikTokShopScraper:
         await element.evaluate("""
             (el, text) => {
                 // React 내부 상태 키를 찾아서 직접 업데이트
-                const reactPropsKey = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+                const reactPropsKey = Object.keys(el).find(k =>
+                    k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
                 if (reactPropsKey && el[reactPropsKey] && el[reactPropsKey].onChange) {
                     // React onChange 핸들러 직접 호출
                     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -611,14 +679,17 @@ class TikTokShopScraper:
                     nativeInputValueSetter.call(el, text);
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                    // React 16+ 호환 이벤트도 발생
-                    const inputEvent = new InputEvent('input', {
-                        bubbles: true,
-                        cancelable: false,
-                        inputType: 'insertText',
-                        data: text,
-                    });
-                    el.dispatchEvent(inputEvent);
+                    // React 16 호환: char-by-char InputEvent 디스패치
+                    for (let i = 0; i < text.length; i++) {
+                        const partial = text.substring(0, i + 1);
+                        nativeInputValueSetter.call(el, partial);
+                        el.dispatchEvent(new InputEvent('input', {
+                            bubbles: true,
+                            cancelable: true,
+                            inputType: 'insertText',
+                            data: text[i],
+                        }));
+                    }
                 }
             }
         """, text)
@@ -709,17 +780,53 @@ class TikTokShopScraper:
     async def _human_type_field(self, locator, text: str, label: str) -> bool:
         """인간 유사 키보드 입력으로 필드에 텍스트를 입력.
 
-        TikTok React 컴포넌트는 Playwright fill()이나 press_sequentially()의
-        CDP 이벤트로는 state가 업데이트되지 않을 수 있음.
-        page.keyboard.type()으로 브라우저 입력 파이프라인을 통한 키 이벤트 전달.
+        TikTok React 16 컴포넌트는 일반 fill()이나 keyboard.type()으로
+        React 내부 state가 업데이트되지 않음 (특히 Xvfb 환경).
+        nativeInputValueSetter + InputEvent(insertText) 글자별 디스패치가 가장 안정적.
         """
         page = self._page
         try:
+            # 방법 0 (최우선): nativeInputValueSetter + InputEvent char-by-char
+            # Xvfb 환경에서 keyboard.type이 실패해도 이 방법은 안정적으로 동작.
+            # React 16의 __reactEventHandlers$가 InputEvent('insertText')를 감지.
+            await locator.click()
+            await page.wait_for_timeout(random.randint(200, 500))
+
+            try:
+                result = await locator.evaluate("""
+                    (input, value) => {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ).set;
+                        input.focus();
+                        setter.call(input, '');
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+
+                        for (let i = 0; i < value.length; i++) {
+                            const partial = value.substring(0, i + 1);
+                            setter.call(input, partial);
+                            input.dispatchEvent(new InputEvent('input', {
+                                bubbles: true,
+                                cancelable: true,
+                                inputType: 'insertText',
+                                data: value[i],
+                            }));
+                        }
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        return input.value;
+                    }
+                """, text)
+                if result == text:
+                    logger.info(f"{label} 입력 성공 (nativeInputValueSetter char-by-char)")
+                    return True
+                logger.info(f"{label} nativeInputValueSetter 후 '{str(result)[:20]}' - keyboard.type 시도")
+            except Exception as e:
+                logger.info(f"{label} nativeInputValueSetter 실패: {e}")
+
             # 방법 1: focus → keyboard.type (브라우저 입력 파이프라인 사용)
             await locator.click()
             await page.wait_for_timeout(random.randint(300, 700))
 
-            # 기존 값 클리어 (있다면)
             current_val = await locator.input_value()
             if current_val:
                 await page.keyboard.press("Control+a")
@@ -727,7 +834,6 @@ class TikTokShopScraper:
                 await page.keyboard.press("Backspace")
                 await page.wait_for_timeout(200)
 
-            # keyboard.type으로 글자별 입력 (랜덤 딜레이)
             delay = random.randint(80, 150)
             await page.keyboard.type(text, delay=delay)
             await page.wait_for_timeout(random.randint(300, 600))
@@ -753,7 +859,6 @@ class TikTokShopScraper:
             logger.warning(f"{label} keyboard.type 실패 '{val[:20]}' → fill()+React event 시도")
             await locator.fill(text)
             await page.wait_for_timeout(200)
-            # React controlled input: native setter + synthetic events로 React state 동기화
             await locator.evaluate("""
                 (el, val) => {
                     const setter = Object.getOwnPropertyDescriptor(
@@ -761,12 +866,23 @@ class TikTokShopScraper:
                     setter.call(el, val);
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                    const reactKey = Object.keys(el).find(
-                        k => k.startsWith('__reactFiber$') || k.startsWith('__reactProps$'));
-                    if (reactKey) {
-                        const fiber = el[reactKey];
+                    // React 16: __reactEventHandlers$, React 17+: __reactProps$
+                    const handlerKey = Object.keys(el).find(
+                        k => k.startsWith('__reactEventHandlers$') ||
+                             k.startsWith('__reactProps$'));
+                    if (handlerKey) {
+                        const handlers = el[handlerKey];
+                        if (handlers && handlers.onChange) {
+                            try { handlers.onChange({ target: el }); } catch(e) {}
+                        }
+                    }
+                    const fiberKey = Object.keys(el).find(
+                        k => k.startsWith('__reactFiber$') ||
+                             k.startsWith('__reactInternalInstance$'));
+                    if (fiberKey) {
+                        const fiber = el[fiberKey];
                         if (fiber && fiber.memoizedProps && fiber.memoizedProps.onChange)
-                            fiber.memoizedProps.onChange({ target: el });
+                            try { fiber.memoizedProps.onChange({ target: el }); } catch(e) {}
                     }
                 }
             """, text)
