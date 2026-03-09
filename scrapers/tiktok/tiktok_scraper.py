@@ -566,16 +566,22 @@ class TikTokShopScraper:
             # 스크린샷: Continue 클릭 전
             await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
 
-            # 네트워크 요청 모니터링 설정
+            # 네트워크 + 콘솔 모니터링 설정
             network_requests = []
+            console_errors = []
             def on_request(request):
-                if "login" in request.url or "auth" in request.url or "account" in request.url:
-                    network_requests.append(f"REQ: {request.method} {request.url[:100]}")
+                # POST 요청과 login/auth/passport/sso 관련 GET도 캡처
+                if request.method == "POST" or any(k in request.url for k in ["login", "auth", "passport", "sso", "captcha"]):
+                    network_requests.append(f"REQ: {request.method} {request.url[:120]}")
             def on_response(response):
-                if "login" in response.url or "auth" in response.url or "account" in response.url:
-                    network_requests.append(f"RES: {response.status} {response.url[:100]}")
+                if response.request.method == "POST" or any(k in response.url for k in ["login", "auth", "passport", "sso", "captcha"]):
+                    network_requests.append(f"RES: {response.status} {response.url[:120]}")
+            def on_console(msg):
+                if msg.type in ("error", "warning"):
+                    console_errors.append(f"[{msg.type}] {msg.text[:150]}")
             page.on("request", on_request)
             page.on("response", on_response)
+            page.on("console", on_console)
 
             # Continue 버튼 클릭
             continue_btn = page.locator('button:has-text("Continue"):visible').first
@@ -595,15 +601,41 @@ class TikTokShopScraper:
             submit_url = page.url
             logger.info(f"제출 후 URL: {submit_url}")
             if network_requests:
-                for nr in network_requests[:10]:
+                for nr in network_requests[:15]:
                     logger.info(f"네트워크: {nr}")
             else:
-                logger.info("네트워크: Continue 클릭 후 login/auth 관련 요청 없음!")
+                logger.info("네트워크: Continue 클릭 후 POST/login 관련 요청 없음!")
+            if console_errors:
+                for ce in console_errors[:10]:
+                    logger.info(f"콘솔: {ce}")
+
+            # 숨겨진 에러 메시지 확인
+            error_check = await page.evaluate("""
+                () => {
+                    const errors = [];
+                    // 일반적인 에러 클래스들
+                    for (const sel of ['.error', '.err', '[class*="error"]', '[class*="Error"]',
+                                       '[class*="alert"]', '[class*="warn"]', '[class*="invalid"]',
+                                       '[class*="message"]', '[role="alert"]']) {
+                        const els = document.querySelectorAll(sel);
+                        els.forEach(el => {
+                            const text = el.textContent?.trim();
+                            if (text && text.length < 200) errors.push(sel + ': ' + text.substring(0, 100));
+                        });
+                    }
+                    return errors.slice(0, 10);
+                }
+            """)
+            if error_check:
+                for ec in error_check:
+                    logger.info(f"페이지 에러: {ec}")
+
             await page.screenshot(path=f"{self.data_dir}/debug_after_continue.png")
 
             # 이벤트 리스너 정리
             page.remove_listener("request", on_request)
             page.remove_listener("response", on_response)
+            page.remove_listener("console", on_console)
 
             # Continue 클릭이 무시되었는지 확인 → 비밀번호 필드 Enter로 재시도
             if "/account/login" in submit_url:
