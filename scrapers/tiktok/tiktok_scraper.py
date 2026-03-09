@@ -384,15 +384,23 @@ class TikTokShopScraper:
         page = self._page
 
         try:
-            # 로그인 페이지로 이동 (register 리다이렉트 대비)
+            # 로그인 페이지로 이동 (프록시 사용 시 느릴 수 있음 → 60초 타임아웃)
             try:
-                await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
-                # register로 리다이렉트될 수 있음
                 logger.info(f"로그인 페이지 이동 중 리다이렉트: {e}")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(5000)
 
-            await page.wait_for_timeout(3000)
+            # 로그인 폼이 렌더링될 때까지 대기 (프록시 경유 시 느릴 수 있음)
+            try:
+                await page.wait_for_selector(
+                    'input[name="email"], input[type="email"], input[type="password"], button:has-text("Continue")',
+                    timeout=30000,
+                )
+                logger.info("로그인 폼 렌더링 확인")
+            except Exception:
+                logger.warning("로그인 폼 대기 타임아웃 → 현재 페이지에서 진행")
+            await page.wait_for_timeout(2000)
 
             # iframe 감지: 로그인 폼이 iframe 안에 있을 수 있음
             login_frame = None
