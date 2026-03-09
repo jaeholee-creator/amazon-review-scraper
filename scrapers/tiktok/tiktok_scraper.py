@@ -381,19 +381,32 @@ class TikTokShopScraper:
 
             await page.wait_for_timeout(3000)
 
+            # iframe 감지: 로그인 폼이 iframe 안에 있을 수 있음
+            login_frame = None
+            frames = page.frames
+            if len(frames) > 1:
+                logger.info(f"페이지 내 프레임 {len(frames)}개 감지")
+                for frame in frames:
+                    frame_url = frame.url
+                    if "account" in frame_url or "login" in frame_url or "auth" in frame_url:
+                        logger.info(f"로그인 iframe 감지: {frame_url}")
+                        login_frame = frame
+                        break
+            target = login_frame if login_frame else page
+
             # register 페이지면 "Log in" 링크 클릭
             current_url = page.url
             if "/account/register" in current_url:
                 logger.info("Register 페이지 감지 → Log in 링크 클릭")
                 # 상단 네비게이션의 "Log in" 링크
-                login_link = await page.query_selector('a[href*="/account/login"]')
+                login_link = await target.query_selector('a[href*="/account/login"]')
                 if login_link:
                     await login_link.click()
                     await page.wait_for_timeout(3000)
                 else:
                     # 텍스트로 찾기
                     for sel in ['text="Log in"', 'a:has-text("Log in")']:
-                        el = await page.query_selector(sel)
+                        el = await target.query_selector(sel)
                         if el:
                             await el.click()
                             await page.wait_for_timeout(3000)
@@ -406,7 +419,7 @@ class TikTokShopScraper:
                 'span:has-text("Log in")',
             ]:
                 try:
-                    login_tab = await page.query_selector(selector)
+                    login_tab = await target.query_selector(selector)
                     if login_tab and await login_tab.is_visible():
                         await login_tab.click()
                         logger.info(f"Log in 탭 클릭: {selector}")
@@ -416,14 +429,13 @@ class TikTokShopScraper:
                     continue
 
             # Email 탭 선택 (Phone이 기본일 수 있음)
-            email_tab = await page.query_selector('[data-tid="emailTab"], [id*="email"]')
+            email_tab = await target.query_selector('[data-tid="emailTab"], [id*="email"]')
             if email_tab:
                 await email_tab.click()
                 await page.wait_for_timeout(1000)
 
-            # === 인간 유사 입력: press_sequentially + 랜덤 딜레이 ===
-            # fill()은 즉시 입력이라 TikTok 행동 분석에 봇으로 감지됨.
-            # 실제 키보드 이벤트(press_sequentially)로 입력해야 함.
+            # === 인간 유사 입력 ===
+            # keyboard.type / insert_text → isTrusted:true 이벤트 생성
 
             # 이메일 필드 찾기
             email_selectors = [
@@ -434,7 +446,7 @@ class TikTokShopScraper:
             email_filled = False
             for sel in email_selectors:
                 try:
-                    locator = page.locator(sel).first
+                    locator = target.locator(sel).first if login_frame else page.locator(sel).first
                     if await locator.count() > 0:
                         email_filled = await self._human_type_field(locator, self.email, "이메일")
                         if email_filled:
@@ -458,7 +470,7 @@ class TikTokShopScraper:
             pw_filled = False
             for sel in pw_selectors:
                 try:
-                    locator = page.locator(sel).first
+                    locator = target.locator(sel).first if login_frame else page.locator(sel).first
                     if await locator.count() > 0:
                         pw_filled = await self._human_type_field(locator, self.password, "비밀번호")
                         if pw_filled:
@@ -779,18 +791,28 @@ class TikTokShopScraper:
     async def _human_type_field(self, locator, text: str, label: str) -> bool:
         """인간 유사 키보드 입력으로 필드에 텍스트를 입력.
 
-        Patchright의 keyboard.type()은 브라우저 입력 파이프라인을 통해
-        isTrusted: true 이벤트를 생성하므로 TikTok 봇 탐지를 우회.
-        nativeInputValueSetter는 isTrusted: false 이벤트를 생성하여
-        TikTok이 폼 제출을 거부하므로 사용하지 않음.
+        방법 우선순위:
+        0. evaluate focus + keyboard.type (isTrusted:true, 가장 확실한 포커스)
+        1. CDP Input.insertText 문자별 (isTrusted:true, 포커스 무관)
+        2. press_sequentially (Patchright 네이티브)
+        3. fill() + React event (최후 수단, isTrusted:false)
         """
         page = self._page
         try:
-            # 방법 0 (최우선): focus → keyboard.type (Patchright 네이티브)
-            # Patchright keyboard.type은 실제 키보드 이벤트(isTrusted:true)를 생성.
-            # TikTok의 봇 탐지가 isTrusted 플래그를 검증하므로 이 방법이 필수.
+            # 방법 0: evaluate로 직접 focus + keyboard.type
+            # locator.click()이 아닌 el.focus()로 확실한 포커스 확보
             await locator.click()
-            await page.wait_for_timeout(random.randint(300, 700))
+            await page.wait_for_timeout(random.randint(200, 400))
+            # JavaScript로 직접 focus (click 후 focus가 빼앗길 수 있음)
+            await locator.evaluate("el => { el.focus(); el.select && el.select(); }")
+            await page.wait_for_timeout(200)
+
+            # 포커스 디버깅
+            focused_info = await page.evaluate(
+                "() => { const el = document.activeElement; "
+                "return el ? el.tagName + '.' + (el.name || el.type || '') : 'none'; }"
+            )
+            logger.info(f"{label} 포커스 확인: {focused_info}")
 
             current_val = await locator.input_value()
             if current_val:
@@ -808,20 +830,48 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (keyboard.type, delay={delay}ms)")
                 return True
 
-            # 방법 1: triple-click + keyboard.type (이전 값이 남아있을 때)
-            logger.info(f"{label} keyboard.type 후 '{val[:20]}' - triple-click 재시도")
+            logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → CDP insertText 시도")
+
+            # 방법 1: CDP Input.insertText 문자별 전송 (isTrusted:true)
+            # keyboard.type이 실패하면 CDP로 직접 문자를 삽입
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
-            await page.keyboard.type(text, delay=random.randint(60, 120))
-            await page.wait_for_timeout(300)
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(200)
+            await locator.evaluate("el => { el.focus(); el.value = ''; }")
+            await page.wait_for_timeout(100)
 
+            cdp_session = await page.context.new_cdp_session(page)
+            try:
+                for char in text:
+                    await cdp_session.send("Input.dispatchKeyEvent", {
+                        "type": "keyDown",
+                        "text": char,
+                        "key": char,
+                        "code": f"Key{char.upper()}" if char.isalpha() else "",
+                        "windowsVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
+                        "nativeVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
+                    })
+                    await cdp_session.send("Input.dispatchKeyEvent", {
+                        "type": "keyUp",
+                        "key": char,
+                        "code": f"Key{char.upper()}" if char.isalpha() else "",
+                        "windowsVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
+                        "nativeVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
+                    })
+                    await page.wait_for_timeout(random.randint(50, 120))
+            finally:
+                await cdp_session.detach()
+
+            await page.wait_for_timeout(300)
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} 입력 성공 (triple-click + type)")
+                logger.info(f"{label} 입력 성공 (CDP dispatchKeyEvent)")
                 return True
 
+            logger.info(f"{label} CDP dispatchKeyEvent 후 '{val[:20] if val else ''}' → press_sequentially 시도")
+
             # 방법 2: press_sequentially (Patchright 네이티브, 개별 키 이벤트)
-            logger.info(f"{label} keyboard.type 실패 → press_sequentially 시도")
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
             await page.keyboard.press("Backspace")
@@ -835,7 +885,7 @@ class TikTokShopScraper:
                 return True
 
             # 방법 3: fill() + React 이벤트 강제 발생
-            logger.warning(f"{label} keyboard.type 실패 '{val[:20]}' → fill()+React event 시도")
+            logger.warning(f"{label} 모든 키보드 방법 실패 '{val[:20] if val else ''}' → fill()+React event 시도")
             await locator.fill(text)
             await page.wait_for_timeout(200)
             await locator.evaluate("""
@@ -845,7 +895,6 @@ class TikTokShopScraper:
                     setter.call(el, val);
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                    // React 16: __reactEventHandlers$, React 17+: __reactProps$
                     const handlerKey = Object.keys(el).find(
                         k => k.startsWith('__reactEventHandlers$') ||
                              k.startsWith('__reactProps$'));
@@ -871,7 +920,7 @@ class TikTokShopScraper:
                 logger.info(f"{label} fill()+React event 성공")
                 return True
 
-            logger.error(f"{label} 입력 실패: '{val[:20]}'")
+            logger.error(f"{label} 입력 실패: '{val[:20] if val else ''}'")
             return False
         except Exception as e:
             logger.error(f"{label} 입력 오류: {e}")
