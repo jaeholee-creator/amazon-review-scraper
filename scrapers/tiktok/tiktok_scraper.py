@@ -795,27 +795,18 @@ class TikTokShopScraper:
         """인간 유사 키보드 입력으로 필드에 텍스트를 입력.
 
         방법 우선순위:
-        0. evaluate focus + keyboard.type (isTrusted:true, 가장 확실한 포커스)
-        1. CDP Input.insertText 문자별 (isTrusted:true, 포커스 무관)
-        2. press_sequentially (Patchright 네이티브)
-        3. fill() + React event (최후 수단, isTrusted:false)
+        0. xdotool (X11 레벨 실제 키보드 이벤트, Xvfb 환경 전용)
+        1. keyboard.type (Patchright CDP)
+        2. keyboard.insert_text 문자별 (isTrusted:true)
+        3. fill() + React _valueTracker 리셋 (최후 수단)
         """
         page = self._page
         try:
-            # 방법 0: evaluate로 직접 focus + keyboard.type
-            # locator.click()이 아닌 el.focus()로 확실한 포커스 확보
+            # 필드 클릭하여 포커스 확보
             await locator.click()
             await page.wait_for_timeout(random.randint(200, 400))
-            # JavaScript로 직접 focus (click 후 focus가 빼앗길 수 있음)
             await locator.evaluate("el => { el.focus(); el.select && el.select(); }")
             await page.wait_for_timeout(200)
-
-            # 포커스 디버깅
-            focused_info = await page.evaluate(
-                "() => { const el = document.activeElement; "
-                "return el ? el.tagName + '.' + (el.name || el.type || '') : 'none'; }"
-            )
-            logger.info(f"{label} 포커스 확인: {focused_info}")
 
             current_val = await locator.input_value()
             if current_val:
@@ -824,6 +815,37 @@ class TikTokShopScraper:
                 await page.keyboard.press("Backspace")
                 await page.wait_for_timeout(200)
 
+            # 방법 0: xdotool (X11 레벨 실제 키보드 입력)
+            # Xvfb 환경에서 OS 수준 키보드 이벤트를 직접 전송.
+            # CDP/Playwright 레이어를 완전히 우회하여 가장 '진짜' 키보드 입력.
+            display = os.environ.get("DISPLAY")
+            if display:
+                try:
+                    import subprocess as sp
+                    # xdotool type은 KeyPress/KeyRelease X11 이벤트를 생성
+                    delay_ms = random.randint(60, 120)
+                    result = sp.run(
+                        ["xdotool", "type", "--clearmodifiers",
+                         "--delay", str(delay_ms), "--", text],
+                        env={**os.environ, "DISPLAY": display},
+                        capture_output=True, text=True, timeout=30
+                    )
+                    await page.wait_for_timeout(500)
+                    val = await locator.input_value()
+                    if val == text:
+                        logger.info(f"{label} 입력 성공 (xdotool, delay={delay_ms}ms)")
+                        return True
+                    logger.info(f"{label} xdotool 후 '{val[:20] if val else ''}' → keyboard.type 시도")
+                    if result.stderr:
+                        logger.debug(f"xdotool stderr: {result.stderr[:100]}")
+                except Exception as e:
+                    logger.debug(f"xdotool 실패: {e}")
+
+            # 방법 1: keyboard.type (Patchright CDP)
+            await locator.click()
+            await page.wait_for_timeout(200)
+            await locator.evaluate("el => { el.focus(); el.value = ''; }")
+            await page.wait_for_timeout(100)
             delay = random.randint(80, 150)
             await page.keyboard.type(text, delay=delay)
             await page.wait_for_timeout(random.randint(300, 600))
@@ -833,10 +855,9 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (keyboard.type, delay={delay}ms)")
                 return True
 
-            logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → CDP insertText 시도")
+            logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → insert_text 시도")
 
-            # 방법 1: CDP Input.insertText 문자별 전송 (isTrusted:true InputEvent 생성)
-            # keyboard.type이 실패하면 insertText로 직접 텍스트 삽입
+            # 방법 2: keyboard.insert_text 문자별 (isTrusted:true InputEvent)
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
             await page.keyboard.press("Backspace")
@@ -854,20 +875,7 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (keyboard.insert_text)")
                 return True
 
-            logger.info(f"{label} insert_text 후 '{val[:20] if val else ''}' → press_sequentially 시도")
-
-            # 방법 2: press_sequentially (Patchright 네이티브, 개별 키 이벤트)
-            await locator.click(click_count=3)
-            await page.wait_for_timeout(200)
-            await page.keyboard.press("Backspace")
-            await page.wait_for_timeout(200)
-            await locator.press_sequentially(text, delay=random.randint(80, 150))
-            await page.wait_for_timeout(300)
-
-            val = await locator.input_value()
-            if val == text:
-                logger.info(f"{label} 입력 성공 (press_sequentially)")
-                return True
+            logger.info(f"{label} insert_text 후 '{val[:20] if val else ''}' → fill 시도")
 
             # 방법 3: fill() + React _valueTracker 리셋 + 네이티브 이벤트
             # React controlled input은 내부 _valueTracker로 값 변경을 추적.
