@@ -384,9 +384,12 @@ class TikTokShopScraper:
             # iframe 감지: 로그인 폼이 iframe 안에 있을 수 있음
             login_frame = None
             frames = page.frames
+            main_frame = page.main_frame
             if len(frames) > 1:
                 logger.info(f"페이지 내 프레임 {len(frames)}개 감지")
                 for frame in frames:
+                    if frame == main_frame:
+                        continue  # 메인 프레임은 스킵
                     frame_url = frame.url
                     if "account" in frame_url or "login" in frame_url or "auth" in frame_url:
                         logger.info(f"로그인 iframe 감지: {frame_url}")
@@ -832,44 +835,26 @@ class TikTokShopScraper:
 
             logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → CDP insertText 시도")
 
-            # 방법 1: CDP Input.insertText 문자별 전송 (isTrusted:true)
-            # keyboard.type이 실패하면 CDP로 직접 문자를 삽입
+            # 방법 1: CDP Input.insertText 문자별 전송 (isTrusted:true InputEvent 생성)
+            # keyboard.type이 실패하면 insertText로 직접 텍스트 삽입
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
             await page.keyboard.press("Backspace")
             await page.wait_for_timeout(200)
-            await locator.evaluate("el => { el.focus(); el.value = ''; }")
+            await locator.evaluate("el => { el.focus(); }")
             await page.wait_for_timeout(100)
 
-            cdp_session = await page.context.new_cdp_session(page)
-            try:
-                for char in text:
-                    await cdp_session.send("Input.dispatchKeyEvent", {
-                        "type": "keyDown",
-                        "text": char,
-                        "key": char,
-                        "code": f"Key{char.upper()}" if char.isalpha() else "",
-                        "windowsVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
-                        "nativeVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
-                    })
-                    await cdp_session.send("Input.dispatchKeyEvent", {
-                        "type": "keyUp",
-                        "key": char,
-                        "code": f"Key{char.upper()}" if char.isalpha() else "",
-                        "windowsVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
-                        "nativeVirtualKeyCode": ord(char.upper()) if char.isalpha() else ord(char),
-                    })
-                    await page.wait_for_timeout(random.randint(50, 120))
-            finally:
-                await cdp_session.detach()
+            for char in text:
+                await page.keyboard.insert_text(char)
+                await page.wait_for_timeout(random.randint(50, 120))
 
             await page.wait_for_timeout(300)
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} 입력 성공 (CDP dispatchKeyEvent)")
+                logger.info(f"{label} 입력 성공 (keyboard.insert_text)")
                 return True
 
-            logger.info(f"{label} CDP dispatchKeyEvent 후 '{val[:20] if val else ''}' → press_sequentially 시도")
+            logger.info(f"{label} insert_text 후 '{val[:20] if val else ''}' → press_sequentially 시도")
 
             # 방법 2: press_sequentially (Patchright 네이티브, 개별 키 이벤트)
             await locator.click(click_count=3)
@@ -884,40 +869,44 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (press_sequentially)")
                 return True
 
-            # 방법 3: fill() + React 이벤트 강제 발생
-            logger.warning(f"{label} 모든 키보드 방법 실패 '{val[:20] if val else ''}' → fill()+React event 시도")
+            # 방법 3: fill() + React _valueTracker 리셋 + 네이티브 이벤트
+            # React controlled input은 내부 _valueTracker로 값 변경을 추적.
+            # tracker를 리셋해야 React가 새 값을 인식하고 state를 업데이트함.
+            logger.warning(f"{label} 모든 키보드 방법 실패 '{val[:20] if val else ''}' → fill()+React tracker 리셋 시도")
             await locator.fill(text)
             await page.wait_for_timeout(200)
             await locator.evaluate("""
                 (el, val) => {
+                    // React _valueTracker 리셋 (React 16/17/18 호환)
+                    const tracker = el._valueTracker;
+                    if (tracker) {
+                        tracker.setValue('');  // 이전 값을 빈 문자열로 리셋
+                    }
+
+                    // nativeInputValueSetter로 값 설정
                     const setter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value').set;
                     setter.call(el, val);
+
+                    // React SyntheticEvent를 트리거하는 네이티브 이벤트 발생
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                    const handlerKey = Object.keys(el).find(
-                        k => k.startsWith('__reactEventHandlers$') ||
-                             k.startsWith('__reactProps$'));
-                    if (handlerKey) {
-                        const handlers = el[handlerKey];
-                        if (handlers && handlers.onChange) {
-                            try { handlers.onChange({ target: el }); } catch(e) {}
-                        }
-                    }
-                    const fiberKey = Object.keys(el).find(
-                        k => k.startsWith('__reactFiber$') ||
-                             k.startsWith('__reactInternalInstance$'));
-                    if (fiberKey) {
-                        const fiber = el[fiberKey];
-                        if (fiber && fiber.memoizedProps && fiber.memoizedProps.onChange)
-                            try { fiber.memoizedProps.onChange({ target: el }); } catch(e) {}
-                    }
+
+                    // blur + focus로 폼 유효성 검사 트리거
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    el.dispatchEvent(new Event('focus', { bubbles: true }));
                 }
             """, text)
+            await page.wait_for_timeout(500)
+            # Tab으로 blur 이벤트 발생 → React state 확정
+            await page.keyboard.press("Tab")
             await page.wait_for_timeout(300)
+            # 다시 필드로 클릭하여 포커스 복원
+            await locator.click()
+            await page.wait_for_timeout(200)
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} fill()+React event 성공")
+                logger.info(f"{label} fill()+React tracker 리셋 성공")
                 return True
 
             logger.error(f"{label} 입력 실패: '{val[:20] if val else ''}'")
