@@ -488,38 +488,100 @@ class TikTokShopScraper:
             # 비밀번호 입력 → Continue 클릭 사이 인간적 대기
             await page.wait_for_timeout(random.randint(800, 1500))
 
-            # 스크린샷: Continue 클릭 전
-            await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
-
-            # 이메일/비밀번호 모두 입력 후 React state 일괄 동기화
-            # (개별 필드에서 하면 onChange가 폼을 재렌더링하여 다른 필드가 사라질 수 있음)
-            logger.info("React state 일괄 동기화 시작")
+            # fill() 재시도: execCommand/CDP로 입력했더라도 fill()로 덮어쓰기
+            # Playwright fill()은 내부적으로 selectAll → Input.insertText를 사용하며
+            # React의 change detection과 가장 호환성이 높음
+            logger.info("fill() 최종 덮어쓰기 시도")
             for sel in email_selectors:
                 try:
                     loc = target.locator(sel).first if login_frame else page.locator(sel).first
                     if await loc.count() > 0:
-                        await self._sync_react_state(loc, self.email, "이메일")
+                        await loc.fill(self.email)
+                        await page.wait_for_timeout(200)
+                        val = await loc.input_value()
+                        logger.info(f"이메일 fill() 결과: '{val[:20] if val else ''}'")
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"이메일 fill() 실패: {e}")
             await page.wait_for_timeout(300)
             for sel in pw_selectors:
                 try:
                     loc = target.locator(sel).first if login_frame else page.locator(sel).first
                     if await loc.count() > 0:
-                        await self._sync_react_state(loc, self.password, "비밀번호")
+                        await loc.fill(self.password)
+                        await page.wait_for_timeout(200)
+                        val = await loc.input_value()
+                        logger.info(f"비밀번호 fill() 결과: 길이={len(val) if val else 0}")
+                        break
+                except Exception as e:
+                    logger.debug(f"비밀번호 fill() 실패: {e}")
+            await page.wait_for_timeout(500)
+
+            # React state 진단: input의 fiber state 확인
+            for sel in email_selectors:
+                try:
+                    loc = target.locator(sel).first if login_frame else page.locator(sel).first
+                    if await loc.count() > 0:
+                        diag = await loc.evaluate("""
+                            el => {
+                                const result = {
+                                    domValue: el.value,
+                                    hasTracker: !!el._valueTracker,
+                                    trackerValue: el._valueTracker ? el._valueTracker.getValue() : null,
+                                };
+                                // React fiber에서 state 확인
+                                const fk = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+                                result.hasFiber = !!fk;
+                                if (fk) {
+                                    let f = el[fk];
+                                    let depth = 0;
+                                    while (f && depth < 15) {
+                                        const p = f.memoizedProps || f.pendingProps;
+                                        if (p && p.value !== undefined) {
+                                            result.fiberValue = String(p.value).substring(0, 30);
+                                            result.fiberDepth = depth;
+                                            break;
+                                        }
+                                        if (p && p.onChange) {
+                                            result.onChangeAt = depth;
+                                        }
+                                        f = f.return;
+                                        depth++;
+                                    }
+                                }
+                                // __reactProps 확인
+                                const pk = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+                                if (pk) {
+                                    const rp = el[pk];
+                                    result.reactPropsValue = rp && rp.value ? String(rp.value).substring(0, 30) : null;
+                                }
+                                return result;
+                            }
+                        """)
+                        logger.info(f"이메일 React 진단: {diag}")
                         break
                 except Exception:
                     pass
-            await page.wait_for_timeout(500)
-            logger.info("React state 일괄 동기화 완료")
 
-            # Continue 버튼 클릭 (마우스 이동 + 클릭)
+            # 스크린샷: Continue 클릭 전
+            await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
+
+            # 네트워크 요청 모니터링 설정
+            network_requests = []
+            def on_request(request):
+                if "login" in request.url or "auth" in request.url or "account" in request.url:
+                    network_requests.append(f"REQ: {request.method} {request.url[:100]}")
+            def on_response(response):
+                if "login" in response.url or "auth" in response.url or "account" in response.url:
+                    network_requests.append(f"RES: {response.status} {response.url[:100]}")
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            # Continue 버튼 클릭
             continue_btn = page.locator('button:has-text("Continue"):visible').first
             if await continue_btn.count() > 0:
                 is_disabled = await continue_btn.evaluate("el => el.disabled")
                 logger.info(f"Continue 버튼: disabled={is_disabled}")
-                # 버튼 위로 마우스 이동 후 짧은 대기 → 클릭 (인간 행동 모방)
                 await continue_btn.hover()
                 await page.wait_for_timeout(random.randint(200, 500))
                 await continue_btn.click()
@@ -528,11 +590,20 @@ class TikTokShopScraper:
                 logger.info("Continue 버튼 미발견 - Enter 키 사용")
                 await page.keyboard.press("Enter")
 
-            # 제출 후 대기
+            # 제출 후 대기 + 네트워크 로그
             await page.wait_for_timeout(5000)
             submit_url = page.url
             logger.info(f"제출 후 URL: {submit_url}")
+            if network_requests:
+                for nr in network_requests[:10]:
+                    logger.info(f"네트워크: {nr}")
+            else:
+                logger.info("네트워크: Continue 클릭 후 login/auth 관련 요청 없음!")
             await page.screenshot(path=f"{self.data_dir}/debug_after_continue.png")
+
+            # 이벤트 리스너 정리
+            page.remove_listener("request", on_request)
+            page.remove_listener("response", on_response)
 
             # Continue 클릭이 무시되었는지 확인 → 비밀번호 필드 Enter로 재시도
             if "/account/login" in submit_url:
