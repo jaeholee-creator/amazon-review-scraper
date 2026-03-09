@@ -288,24 +288,9 @@ class TikTokShopScraper:
             if "/account/login" in current_url or "/account/register" in current_url:
                 break
 
-        logger.info("세션 만료. 재로그인 진행...")
-
-        # 최대 3회 로그인 시도 (지수 백오프: 5초, 10초, 20초)
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            logger.info(f"로그인 시도 {attempt}/{max_attempts}")
-            success = await self._do_login()
-            if success:
-                # 로그인 성공 시 쿠키 백업
-                await self._save_cookies()
-                return True
-            if attempt < max_attempts:
-                backoff = 5 * (2 ** (attempt - 1))  # 5초, 10초
-                logger.info(f"로그인 실패 - {backoff}초 후 재시도")
-                await page.wait_for_timeout(backoff * 1000)
-
-        # 모든 시도 실패 시 Slack 알림
-        self._notify_captcha_failure()
+        # 쿠키 만료 → 수동 쿠키 갱신 요청 (자동 로그인은 webmssdk에 의해 차단됨)
+        logger.error("세션 만료. 수동 쿠키 갱신이 필요합니다.")
+        self._notify_cookie_expired()
         return False
 
     async def _is_logged_in(self) -> bool:
@@ -780,8 +765,23 @@ class TikTokShopScraper:
             notifier = SlackNotifier()
             notifier.send_error_alert(
                 "TikTok Seller Center 캡차 풀기 실패!\n"
-                "headless 모드에서 캡차가 나타났습니다.\n"
-                "Xvfb headed 모드 또는 Euler Stream API 설정을 확인해주세요."
+                "SadCaptcha로 캡차 자동 풀기에 실패했습니다.\n"
+                "수동 쿠키 갱신이 필요할 수 있습니다:\n"
+                "  python -m scrapers.tiktok.refresh_cookies"
+            )
+        except Exception as e:
+            logger.warning(f"Slack 알림 전송 실패: {e}")
+
+    def _notify_cookie_expired(self):
+        """쿠키 만료 시 Slack 알림 전송 (수동 갱신 요청)"""
+        try:
+            from src.slack_notifier import SlackNotifier
+            notifier = SlackNotifier()
+            notifier.send_error_alert(
+                "🔑 TikTok Seller Center 쿠키 만료!\n"
+                "자동 로그인이 불가능합니다 (webmssdk 봇 탐지).\n"
+                "수동으로 쿠키를 갱신해주세요:\n"
+                "  python -m scrapers.tiktok.refresh_cookies"
             )
         except Exception as e:
             logger.warning(f"Slack 알림 전송 실패: {e}")
@@ -1051,26 +1051,28 @@ class TikTokShopScraper:
             logger.warning(f"{label} React state 동기화 실패: {e}")
 
     async def _recover_session(self) -> bool:
-        """세션 만료 시 재로그인을 시도하여 세션 복구.
+        """세션 만료 시 쿠키 재로드를 시도하여 세션 복구.
+
+        자동 로그인은 webmssdk에 의해 차단되므로,
+        쿠키 파일 재로드만 시도합니다.
 
         Returns:
             True if session was recovered successfully
         """
-        logger.info("세션 복구 시도: 재로그인 진행...")
+        logger.info("세션 복구 시도: 쿠키 재로드...")
         page = self._page
 
-        success = await self._do_login()
-        if success:
-            await self._save_cookies()
-            # Rating 페이지로 복귀
+        # 쿠키 파일 재로드 시도
+        restored = await self._restore_cookies()
+        if restored:
             await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(5000)
             if await self._is_logged_in():
-                logger.info("세션 복구 성공")
+                logger.info("세션 복구 성공 (쿠키 재로드)")
                 return True
 
-        logger.error("세션 복구 실패: 재로그인 불가")
-        self._notify_captcha_failure()
+        logger.error("세션 복구 실패: 수동 쿠키 갱신 필요")
+        self._notify_cookie_expired()
         return False
 
     async def _dismiss_popups(self):
