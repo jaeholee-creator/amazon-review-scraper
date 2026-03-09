@@ -491,6 +491,29 @@ class TikTokShopScraper:
             # 스크린샷: Continue 클릭 전
             await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
 
+            # 이메일/비밀번호 모두 입력 후 React state 일괄 동기화
+            # (개별 필드에서 하면 onChange가 폼을 재렌더링하여 다른 필드가 사라질 수 있음)
+            logger.info("React state 일괄 동기화 시작")
+            for sel in email_selectors:
+                try:
+                    loc = target.locator(sel).first if login_frame else page.locator(sel).first
+                    if await loc.count() > 0:
+                        await self._sync_react_state(loc, self.email, "이메일")
+                        break
+                except Exception:
+                    pass
+            await page.wait_for_timeout(300)
+            for sel in pw_selectors:
+                try:
+                    loc = target.locator(sel).first if login_frame else page.locator(sel).first
+                    if await loc.count() > 0:
+                        await self._sync_react_state(loc, self.password, "비밀번호")
+                        break
+                except Exception:
+                    pass
+            await page.wait_for_timeout(500)
+            logger.info("React state 일괄 동기화 완료")
+
             # Continue 버튼 클릭 (마우스 이동 + 클릭)
             continue_btn = page.locator('button:has-text("Continue"):visible').first
             if await continue_btn.count() > 0:
@@ -900,21 +923,16 @@ class TikTokShopScraper:
             await page.wait_for_timeout(300)
             val = await locator.input_value()
             if val == text:
-                # DOM 값은 설정됐지만 React state 싱크가 필요할 수 있음
-                # _valueTracker 리셋 + 이벤트 재발생으로 React state 강제 업데이트
-                await self._sync_react_state(locator, text, label)
                 logger.info(f"{label} 입력 성공 (CDP keydown+insertText)")
                 return True
 
-            logger.info(f"{label} CDP keydown+insertText 후 '{val[:20] if val else ''}' → fill+React 시도")
+            logger.info(f"{label} CDP keydown+insertText 후 '{val[:20] if val else ''}' → fill 시도")
 
-            # 방법 3: fill() + React state 강제 동기화
-            logger.warning(f"{label} 키보드 방법 실패 → fill()+React state 동기화 시도")
+            # 방법 3: fill() (DOM 값 설정, React state는 _do_login에서 일괄 동기화)
+            logger.warning(f"{label} 키보드 방법 실패 → fill() 시도")
             await locator.fill("")
             await page.wait_for_timeout(100)
             await locator.fill(text)
-            await page.wait_for_timeout(200)
-            await self._sync_react_state(locator, text, label)
             await page.wait_for_timeout(300)
             # 다시 필드로 클릭하여 포커스 복원
             await locator.click()
