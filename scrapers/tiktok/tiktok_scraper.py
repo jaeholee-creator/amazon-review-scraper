@@ -900,42 +900,21 @@ class TikTokShopScraper:
             await page.wait_for_timeout(300)
             val = await locator.input_value()
             if val == text:
+                # DOM 값은 설정됐지만 React state 싱크가 필요할 수 있음
+                # _valueTracker 리셋 + 이벤트 재발생으로 React state 강제 업데이트
+                await self._sync_react_state(locator, text, label)
                 logger.info(f"{label} 입력 성공 (CDP keydown+insertText)")
                 return True
 
-            logger.info(f"{label} CDP keydown+insertText 후 '{val[:20] if val else ''}' → fill 시도")
+            logger.info(f"{label} CDP keydown+insertText 후 '{val[:20] if val else ''}' → fill+React 시도")
 
-            # 방법 3: fill() + React _valueTracker 리셋 + 네이티브 이벤트
-            # React controlled input은 내부 _valueTracker로 값 변경을 추적.
-            # tracker를 리셋해야 React가 새 값을 인식하고 state를 업데이트함.
-            logger.warning(f"{label} 모든 키보드 방법 실패 '{val[:20] if val else ''}' → fill()+React tracker 리셋 시도")
+            # 방법 3: fill() + React state 강제 동기화
+            logger.warning(f"{label} 키보드 방법 실패 → fill()+React state 동기화 시도")
+            await locator.fill("")
+            await page.wait_for_timeout(100)
             await locator.fill(text)
             await page.wait_for_timeout(200)
-            await locator.evaluate("""
-                (el, val) => {
-                    // React _valueTracker 리셋 (React 16/17/18 호환)
-                    const tracker = el._valueTracker;
-                    if (tracker) {
-                        tracker.setValue('');  // 이전 값을 빈 문자열로 리셋
-                    }
-
-                    // nativeInputValueSetter로 값 설정
-                    const setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(el, val);
-
-                    // React SyntheticEvent를 트리거하는 네이티브 이벤트 발생
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-
-                    // blur + focus로 폼 유효성 검사 트리거
-                    el.dispatchEvent(new Event('blur', { bubbles: true }));
-                    el.dispatchEvent(new Event('focus', { bubbles: true }));
-                }
-            """, text)
-            await page.wait_for_timeout(500)
-            # Tab으로 blur 이벤트 발생 → React state 확정
-            await page.keyboard.press("Tab")
+            await self._sync_react_state(locator, text, label)
             await page.wait_for_timeout(300)
             # 다시 필드로 클릭하여 포커스 복원
             await locator.click()
@@ -950,6 +929,82 @@ class TikTokShopScraper:
         except Exception as e:
             logger.error(f"{label} 입력 오류: {e}")
             return False
+
+    async def _sync_react_state(self, locator, text: str, label: str):
+        """React controlled input의 내부 state를 DOM 값과 동기화.
+
+        insert_text/fill로 DOM value가 설정되어도 React state는 빈 문자열일 수 있음.
+        _valueTracker 리셋 + nativeInputValueSetter + 이벤트 재발생으로
+        React의 onChange를 강제 트리거하여 internal state를 업데이트.
+        """
+        page = self._page
+        try:
+            await locator.evaluate("""
+                (el, val) => {
+                    // 1. React _valueTracker 리셋
+                    // React는 _valueTracker로 값 변경을 추적. 리셋하면 다음
+                    // change/input 이벤트에서 React가 값 변경을 감지함.
+                    const tracker = el._valueTracker;
+                    if (tracker) tracker.setValue('');
+
+                    // 2. nativeInputValueSetter로 값을 한 번 더 설정
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, val);
+
+                    // 3. React SyntheticEvent 트리거
+                    // React 16-18은 document level에서 이벤트를 위임 처리.
+                    // bubbles:true로 document까지 전파되어야 React가 캐치.
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    // 4. React fiber memoizedProps.onChange 직접 호출
+                    const fiberKey = Object.keys(el).find(
+                        k => k.startsWith('__reactFiber$') ||
+                             k.startsWith('__reactInternalInstance$'));
+                    if (fiberKey) {
+                        let fiber = el[fiberKey];
+                        // 컴포넌트 트리를 올라가며 onChange 찾기
+                        while (fiber) {
+                            const props = fiber.memoizedProps || fiber.pendingProps;
+                            if (props && props.onChange) {
+                                try {
+                                    props.onChange({
+                                        target: el,
+                                        currentTarget: el,
+                                        type: 'change',
+                                        nativeEvent: new Event('change'),
+                                        preventDefault: () => {},
+                                        stopPropagation: () => {},
+                                        persist: () => {},
+                                    });
+                                } catch(e) {}
+                                break;
+                            }
+                            fiber = fiber.return;
+                        }
+                    }
+
+                    // 5. React 16 __reactEventHandlers$ 방식도 시도
+                    const handlerKey = Object.keys(el).find(
+                        k => k.startsWith('__reactEventHandlers$') ||
+                             k.startsWith('__reactProps$'));
+                    if (handlerKey) {
+                        const handlers = el[handlerKey];
+                        if (handlers && handlers.onChange) {
+                            try {
+                                handlers.onChange({
+                                    target: el,
+                                    currentTarget: el,
+                                });
+                            } catch(e) {}
+                        }
+                    }
+                }
+            """, text)
+            logger.debug(f"{label} React state 동기화 완료")
+        except Exception as e:
+            logger.debug(f"{label} React state 동기화 실패: {e}")
 
     async def _recover_session(self) -> bool:
         """세션 만료 시 재로그인을 시도하여 세션 복구.
