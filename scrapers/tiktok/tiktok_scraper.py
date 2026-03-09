@@ -98,29 +98,28 @@ class TikTokShopScraper:
             logger.info(f"DISPLAY={display} 감지 → Xvfb headed 모드로 전환")
             use_headless = False
 
+        # Patchright는 Chromium 바이너리에서 자동화 마커를 제거하므로
+        # --disable-blink-features=AutomationControlled, ignore_default_args 등은 불필요.
+        # 오히려 이런 플래그가 있으면 안티봇 시스템이 "우회 시도"로 탐지할 수 있음.
+        # 서버가 Linux이므로 UA도 Linux로 설정 (Mac UA + Linux 서버 = 핑거프린트 불일치).
         launch_kwargs = dict(
             headless=use_headless,
             viewport={"width": 1440, "height": 900},
             user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "Mozilla/5.0 (X11; Linux x86_64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/133.0.0.0 Safari/537.36"
+                "Chrome/134.0.0.0 Safari/537.36"
             ),
             locale="en-US",
             timezone_id="America/New_York",
-            ignore_default_args=["--enable-automation"],
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-software-rasterizer",
-                "--disable-features=VizDisplayCompositor",
-                "--disable-extensions",
                 "--no-first-run",
-                "--no-restore-session-state",
                 "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
             ],
         )
         try:
@@ -780,50 +779,16 @@ class TikTokShopScraper:
     async def _human_type_field(self, locator, text: str, label: str) -> bool:
         """인간 유사 키보드 입력으로 필드에 텍스트를 입력.
 
-        TikTok React 16 컴포넌트는 일반 fill()이나 keyboard.type()으로
-        React 내부 state가 업데이트되지 않음 (특히 Xvfb 환경).
-        nativeInputValueSetter + InputEvent(insertText) 글자별 디스패치가 가장 안정적.
+        Patchright의 keyboard.type()은 브라우저 입력 파이프라인을 통해
+        isTrusted: true 이벤트를 생성하므로 TikTok 봇 탐지를 우회.
+        nativeInputValueSetter는 isTrusted: false 이벤트를 생성하여
+        TikTok이 폼 제출을 거부하므로 사용하지 않음.
         """
         page = self._page
         try:
-            # 방법 0 (최우선): nativeInputValueSetter + InputEvent char-by-char
-            # Xvfb 환경에서 keyboard.type이 실패해도 이 방법은 안정적으로 동작.
-            # React 16의 __reactEventHandlers$가 InputEvent('insertText')를 감지.
-            await locator.click()
-            await page.wait_for_timeout(random.randint(200, 500))
-
-            try:
-                result = await locator.evaluate("""
-                    (input, value) => {
-                        const setter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        ).set;
-                        input.focus();
-                        setter.call(input, '');
-                        input.dispatchEvent(new Event('input', { bubbles: true }));
-
-                        for (let i = 0; i < value.length; i++) {
-                            const partial = value.substring(0, i + 1);
-                            setter.call(input, partial);
-                            input.dispatchEvent(new InputEvent('input', {
-                                bubbles: true,
-                                cancelable: true,
-                                inputType: 'insertText',
-                                data: value[i],
-                            }));
-                        }
-                        input.dispatchEvent(new Event('change', { bubbles: true }));
-                        return input.value;
-                    }
-                """, text)
-                if result == text:
-                    logger.info(f"{label} 입력 성공 (nativeInputValueSetter char-by-char)")
-                    return True
-                logger.info(f"{label} nativeInputValueSetter 후 '{str(result)[:20]}' - keyboard.type 시도")
-            except Exception as e:
-                logger.info(f"{label} nativeInputValueSetter 실패: {e}")
-
-            # 방법 1: focus → keyboard.type (브라우저 입력 파이프라인 사용)
+            # 방법 0 (최우선): focus → keyboard.type (Patchright 네이티브)
+            # Patchright keyboard.type은 실제 키보드 이벤트(isTrusted:true)를 생성.
+            # TikTok의 봇 탐지가 isTrusted 플래그를 검증하므로 이 방법이 필수.
             await locator.click()
             await page.wait_for_timeout(random.randint(300, 700))
 
@@ -843,7 +808,7 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (keyboard.type, delay={delay}ms)")
                 return True
 
-            # 방법 2: triple-click + keyboard.type
+            # 방법 1: triple-click + keyboard.type (이전 값이 남아있을 때)
             logger.info(f"{label} keyboard.type 후 '{val[:20]}' - triple-click 재시도")
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
@@ -853,6 +818,20 @@ class TikTokShopScraper:
             val = await locator.input_value()
             if val == text:
                 logger.info(f"{label} 입력 성공 (triple-click + type)")
+                return True
+
+            # 방법 2: press_sequentially (Patchright 네이티브, 개별 키 이벤트)
+            logger.info(f"{label} keyboard.type 실패 → press_sequentially 시도")
+            await locator.click(click_count=3)
+            await page.wait_for_timeout(200)
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(200)
+            await locator.press_sequentially(text, delay=random.randint(80, 150))
+            await page.wait_for_timeout(300)
+
+            val = await locator.input_value()
+            if val == text:
+                logger.info(f"{label} 입력 성공 (press_sequentially)")
                 return True
 
             # 방법 3: fill() + React 이벤트 강제 발생
