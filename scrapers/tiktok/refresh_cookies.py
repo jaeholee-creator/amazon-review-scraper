@@ -1,11 +1,13 @@
+#!/usr/bin/env python3
 """
-TikTok Seller Center 수동 쿠키 갱신 스크립트
+TikTok Seller Center 수동 쿠키 갱신 스크립트 (standalone)
 
 로컬 브라우저에서 수동 로그인 후 쿠키를 추출하여 서버에 전송합니다.
+patchright 없이 일반 playwright로 동작합니다.
 
 사용법:
-    python -m scrapers.tiktok.refresh_cookies              # 로컬에서 브라우저 열기 + 쿠키 저장
-    python -m scrapers.tiktok.refresh_cookies --deploy      # 쿠키를 서버에도 전송
+    python3 scrapers/tiktok/refresh_cookies.py              # 로컬에서 브라우저 열기 + 쿠키 저장
+    python3 scrapers/tiktok/refresh_cookies.py --deploy      # 쿠키를 서버에도 전송
 """
 import asyncio
 import json
@@ -14,12 +16,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from patchright.async_api import async_playwright
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    print("❌ playwright가 설치되어 있지 않습니다.")
+    print("   pip3 install playwright && python3 -m playwright install chromium")
+    sys.exit(1)
 
 
 SELLER_CENTER_URL = "https://seller-us.tiktok.com"
 RATING_PAGE_URL = "https://seller-us.tiktok.com/product/rating?shop_region=US"
-DATA_DIR = "data/tiktok"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "tiktok")
 COOKIE_FILE = os.path.join(DATA_DIR, "cookies.json")
 # SSH alias for the production server
 SERVER_SSH = "oracle-cloud"
@@ -57,7 +64,6 @@ async def open_browser_and_wait_for_login():
         await page.wait_for_timeout(5000)
         current_url = page.url
         if "/account/login" not in current_url and "/account/register" not in current_url:
-            # Seller Center 내부 페이지에 있는지 확인
             if "seller-us.tiktok.com" in current_url:
                 logged_in = True
                 print(f"✅ 로그인 성공! URL: {current_url[:80]}")
@@ -133,7 +139,7 @@ def main():
         deploy_cookies_to_server()
     else:
         print(f"\n💡 서버에 쿠키를 전송하려면:")
-        print(f"   python -m scrapers.tiktok.refresh_cookies --deploy")
+        print(f"   python3 scrapers/tiktok/refresh_cookies.py --deploy")
         print(f"   또는 수동으로: scp {COOKIE_FILE} {SERVER_SSH}:{SERVER_COOKIE_PATH}")
 
 
