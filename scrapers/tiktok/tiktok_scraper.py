@@ -838,31 +838,31 @@ class TikTokShopScraper:
                 await page.keyboard.press("Backspace")
                 await page.wait_for_timeout(200)
 
-            # 방법 0: xdotool (X11 레벨 실제 키보드 입력)
-            # Xvfb 환경에서 OS 수준 키보드 이벤트를 직접 전송.
-            # CDP/Playwright 레이어를 완전히 우회하여 가장 '진짜' 키보드 입력.
-            display = os.environ.get("DISPLAY")
-            if display:
-                try:
-                    import subprocess as sp
-                    # xdotool type은 KeyPress/KeyRelease X11 이벤트를 생성
-                    delay_ms = random.randint(60, 120)
-                    result = sp.run(
-                        ["xdotool", "type", "--clearmodifiers",
-                         "--delay", str(delay_ms), "--", text],
-                        env={**os.environ, "DISPLAY": display},
-                        capture_output=True, text=True, timeout=30
-                    )
-                    await page.wait_for_timeout(500)
-                    val = await locator.input_value()
-                    if val == text:
-                        logger.info(f"{label} 입력 성공 (xdotool, delay={delay_ms}ms)")
-                        return True
-                    logger.info(f"{label} xdotool 후 '{val[:20] if val else ''}' → keyboard.type 시도")
-                    if result.stderr:
-                        logger.debug(f"xdotool stderr: {result.stderr[:100]}")
-                except Exception as e:
-                    logger.debug(f"xdotool 실패: {e}")
+            # 방법 0: execCommand('insertText') — 브라우저 편집 엔진 경유
+            # document.execCommand는 브라우저 내부 편집 명령으로 처리되어
+            # InputEvent(isTrusted:true, inputType:'insertText')를 생성.
+            # React의 이벤트 위임 시스템이 이 이벤트를 정상 감지하여 onChange 트리거.
+            await locator.click()
+            await page.wait_for_timeout(200)
+            await page.keyboard.press("Control+a")
+            await page.wait_for_timeout(100)
+
+            # execCommand로 텍스트 삽입 (isTrusted:true 이벤트 생성)
+            exec_result = await locator.evaluate("""
+                (el, text) => {
+                    el.focus();
+                    // 기존 텍스트 전체 선택 후 교체
+                    if (el.select) el.select();
+                    const ok = document.execCommand('insertText', false, text);
+                    return { ok, val: el.value };
+                }
+            """, text)
+            await page.wait_for_timeout(500)
+            val = await locator.input_value()
+            if val == text:
+                logger.info(f"{label} 입력 성공 (execCommand insertText)")
+                return True
+            logger.info(f"{label} execCommand 후 val='{val[:20] if val else ''}', result={exec_result} → keyboard.type 시도")
 
             # 방법 1: keyboard.type (Patchright CDP)
             await locator.click()
@@ -881,9 +881,6 @@ class TikTokShopScraper:
             logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → CDP keydown+insertText 시도")
 
             # 방법 2: CDP keydown + insertText + keyup 조합
-            # TikTok은 keydown 이벤트 없이 발생한 input 이벤트를 무시함.
-            # keydown(isTrusted:true) → insertText(isTrusted:true) → keyup 순서로
-            # 각 문자를 전송하면 실제 키보드 입력과 동일한 이벤트 시퀀스를 생성.
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
             await page.keyboard.press("Backspace")
@@ -898,7 +895,6 @@ class TikTokShopScraper:
                     code = f"Key{char.upper()}" if char.isalpha() else ""
                     vk = ord(char.upper()) if char.isalpha() else ord(char)
 
-                    # 1. keyDown (브라우저가 키 눌림을 인식)
                     await cdp_session.send("Input.dispatchKeyEvent", {
                         "type": "keyDown",
                         "key": key,
@@ -906,9 +902,7 @@ class TikTokShopScraper:
                         "windowsVirtualKeyCode": vk,
                         "nativeVirtualKeyCode": vk,
                     })
-                    # 2. insertText (실제 문자 삽입 + isTrusted:true InputEvent)
                     await page.keyboard.insert_text(char)
-                    # 3. keyUp (키 해제)
                     await cdp_session.send("Input.dispatchKeyEvent", {
                         "type": "keyUp",
                         "key": key,
@@ -934,12 +928,11 @@ class TikTokShopScraper:
             await page.wait_for_timeout(100)
             await locator.fill(text)
             await page.wait_for_timeout(300)
-            # 다시 필드로 클릭하여 포커스 복원
             await locator.click()
             await page.wait_for_timeout(200)
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} fill()+React tracker 리셋 성공")
+                logger.info(f"{label} fill() 성공")
                 return True
 
             logger.error(f"{label} 입력 실패: '{val[:20] if val else ''}'")
@@ -952,38 +945,56 @@ class TikTokShopScraper:
         """React controlled input의 내부 state를 DOM 값과 동기화.
 
         insert_text/fill로 DOM value가 설정되어도 React state는 빈 문자열일 수 있음.
-        _valueTracker 리셋 + nativeInputValueSetter + 이벤트 재발생으로
-        React의 onChange를 강제 트리거하여 internal state를 업데이트.
+        다중 전략으로 React의 onChange를 강제 트리거하여 internal state를 업데이트.
         """
         page = self._page
         try:
-            await locator.evaluate("""
+            result = await locator.evaluate("""
                 (el, val) => {
-                    // 1. React _valueTracker 리셋
-                    // React는 _valueTracker로 값 변경을 추적. 리셋하면 다음
-                    // change/input 이벤트에서 React가 값 변경을 감지함.
-                    const tracker = el._valueTracker;
-                    if (tracker) tracker.setValue('');
+                    const log = [];
 
-                    // 2. nativeInputValueSetter로 값을 한 번 더 설정
+                    // 1. execCommand 방식 시도 (isTrusted:true 이벤트 생성)
+                    el.focus();
+                    if (el.select) el.select();
+                    const execOk = document.execCommand('insertText', false, val);
+                    log.push('execCommand:' + execOk);
+
+                    if (el.value === val) {
+                        log.push('execCommand_value_match');
+                        return { method: 'execCommand', log };
+                    }
+
+                    // 2. _valueTracker 리셋 + nativeInputValueSetter
+                    const tracker = el._valueTracker;
+                    if (tracker) {
+                        tracker.setValue('');
+                        log.push('tracker_reset');
+                    } else {
+                        log.push('no_tracker');
+                    }
+
                     const setter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value').set;
                     setter.call(el, val);
+                    log.push('setter_called');
 
-                    // 3. React SyntheticEvent 트리거
-                    // React 16-18은 document level에서 이벤트를 위임 처리.
-                    // bubbles:true로 document까지 전파되어야 React가 캐치.
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    // 3. InputEvent (not Event) 사용 — React 17+ 호환
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: val,
+                    }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
+                    log.push('events_dispatched');
 
-                    // 4. React fiber memoizedProps.onChange 직접 호출
+                    // 4. React fiber onChange 직접 호출
                     const fiberKey = Object.keys(el).find(
                         k => k.startsWith('__reactFiber$') ||
                              k.startsWith('__reactInternalInstance$'));
                     if (fiberKey) {
                         let fiber = el[fiberKey];
-                        // 컴포넌트 트리를 올라가며 onChange 찾기
-                        while (fiber) {
+                        let depth = 0;
+                        while (fiber && depth < 20) {
                             const props = fiber.memoizedProps || fiber.pendingProps;
                             if (props && props.onChange) {
                                 try {
@@ -991,19 +1002,26 @@ class TikTokShopScraper:
                                         target: el,
                                         currentTarget: el,
                                         type: 'change',
-                                        nativeEvent: new Event('change'),
+                                        nativeEvent: new InputEvent('input'),
                                         preventDefault: () => {},
                                         stopPropagation: () => {},
                                         persist: () => {},
                                     });
-                                } catch(e) {}
+                                    log.push('fiber_onChange_called:depth=' + depth);
+                                } catch(e) {
+                                    log.push('fiber_onChange_error:' + e.message);
+                                }
                                 break;
                             }
                             fiber = fiber.return;
+                            depth++;
                         }
+                        if (depth >= 20) log.push('fiber_onChange_not_found');
+                    } else {
+                        log.push('no_fiber_key');
                     }
 
-                    // 5. React 16 __reactEventHandlers$ 방식도 시도
+                    // 5. __reactProps$ / __reactEventHandlers$ 방식
                     const handlerKey = Object.keys(el).find(
                         k => k.startsWith('__reactEventHandlers$') ||
                              k.startsWith('__reactProps$'));
@@ -1011,18 +1029,20 @@ class TikTokShopScraper:
                         const handlers = el[handlerKey];
                         if (handlers && handlers.onChange) {
                             try {
-                                handlers.onChange({
-                                    target: el,
-                                    currentTarget: el,
-                                });
-                            } catch(e) {}
+                                handlers.onChange({ target: el, currentTarget: el });
+                                log.push('reactProps_onChange_called');
+                            } catch(e) {
+                                log.push('reactProps_onChange_error:' + e.message);
+                            }
                         }
                     }
+
+                    return { method: 'fallback', value: el.value, log };
                 }
             """, text)
-            logger.debug(f"{label} React state 동기화 완료")
+            logger.info(f"{label} React state 동기화: {result}")
         except Exception as e:
-            logger.debug(f"{label} React state 동기화 실패: {e}")
+            logger.warning(f"{label} React state 동기화 실패: {e}")
 
     async def _recover_session(self) -> bool:
         """세션 만료 시 재로그인을 시도하여 세션 복구.
