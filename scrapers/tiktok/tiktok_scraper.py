@@ -855,9 +855,12 @@ class TikTokShopScraper:
                 logger.info(f"{label} 입력 성공 (keyboard.type, delay={delay}ms)")
                 return True
 
-            logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → insert_text 시도")
+            logger.info(f"{label} keyboard.type 후 '{val[:20] if val else ''}' → CDP keydown+insertText 시도")
 
-            # 방법 2: keyboard.insert_text 문자별 (isTrusted:true InputEvent)
+            # 방법 2: CDP keydown + insertText + keyup 조합
+            # TikTok은 keydown 이벤트 없이 발생한 input 이벤트를 무시함.
+            # keydown(isTrusted:true) → insertText(isTrusted:true) → keyup 순서로
+            # 각 문자를 전송하면 실제 키보드 입력과 동일한 이벤트 시퀀스를 생성.
             await locator.click(click_count=3)
             await page.wait_for_timeout(200)
             await page.keyboard.press("Backspace")
@@ -865,17 +868,42 @@ class TikTokShopScraper:
             await locator.evaluate("el => { el.focus(); }")
             await page.wait_for_timeout(100)
 
-            for char in text:
-                await page.keyboard.insert_text(char)
-                await page.wait_for_timeout(random.randint(50, 120))
+            cdp_session = await page.context.new_cdp_session(page)
+            try:
+                for char in text:
+                    key = char
+                    code = f"Key{char.upper()}" if char.isalpha() else ""
+                    vk = ord(char.upper()) if char.isalpha() else ord(char)
+
+                    # 1. keyDown (브라우저가 키 눌림을 인식)
+                    await cdp_session.send("Input.dispatchKeyEvent", {
+                        "type": "keyDown",
+                        "key": key,
+                        "code": code,
+                        "windowsVirtualKeyCode": vk,
+                        "nativeVirtualKeyCode": vk,
+                    })
+                    # 2. insertText (실제 문자 삽입 + isTrusted:true InputEvent)
+                    await page.keyboard.insert_text(char)
+                    # 3. keyUp (키 해제)
+                    await cdp_session.send("Input.dispatchKeyEvent", {
+                        "type": "keyUp",
+                        "key": key,
+                        "code": code,
+                        "windowsVirtualKeyCode": vk,
+                        "nativeVirtualKeyCode": vk,
+                    })
+                    await page.wait_for_timeout(random.randint(50, 120))
+            finally:
+                await cdp_session.detach()
 
             await page.wait_for_timeout(300)
             val = await locator.input_value()
             if val == text:
-                logger.info(f"{label} 입력 성공 (keyboard.insert_text)")
+                logger.info(f"{label} 입력 성공 (CDP keydown+insertText)")
                 return True
 
-            logger.info(f"{label} insert_text 후 '{val[:20] if val else ''}' → fill 시도")
+            logger.info(f"{label} CDP keydown+insertText 후 '{val[:20] if val else ''}' → fill 시도")
 
             # 방법 3: fill() + React _valueTracker 리셋 + 네이티브 이벤트
             # React controlled input은 내부 _valueTracker로 값 변경을 추적.
