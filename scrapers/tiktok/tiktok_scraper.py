@@ -102,6 +102,11 @@ class TikTokShopScraper:
         # --disable-blink-features=AutomationControlled, ignore_default_args 등은 불필요.
         # 오히려 이런 플래그가 있으면 안티봇 시스템이 "우회 시도"로 탐지할 수 있음.
         # 서버가 Linux이므로 UA도 Linux로 설정 (Mac UA + Linux 서버 = 핑거프린트 불일치).
+        # 프록시 설정 (레지덴셜 프록시로 데이터센터 IP 우회)
+        proxy_server = os.environ.get("PROXY_SERVER", "")
+        proxy_user = os.environ.get("PROXY_USERNAME", "")
+        proxy_pass = os.environ.get("PROXY_PASSWORD", "")
+
         launch_kwargs = dict(
             headless=use_headless,
             viewport={"width": 1440, "height": 900},
@@ -122,6 +127,14 @@ class TikTokShopScraper:
                 "--no-default-browser-check",
             ],
         )
+
+        if proxy_server:
+            launch_kwargs["proxy"] = {
+                "server": f"http://{proxy_server}",
+                "username": proxy_user,
+                "password": proxy_pass,
+            }
+            logger.info(f"프록시 사용: {proxy_server} (user={proxy_user[:8]}...)")
         try:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 profile_dir, **launch_kwargs,
@@ -437,10 +450,7 @@ class TikTokShopScraper:
                 await email_tab.click()
                 await page.wait_for_timeout(1000)
 
-            # === 인간 유사 입력 ===
-            # keyboard.type / insert_text → isTrusted:true 이벤트 생성
-
-            # 이메일 필드 찾기
+            # === 이메일 입력 (fill 사용) ===
             email_selectors = [
                 'input[name="email"]:visible',
                 'input[type="email"]:visible',
@@ -451,8 +461,14 @@ class TikTokShopScraper:
                 try:
                     locator = target.locator(sel).first if login_frame else page.locator(sel).first
                     if await locator.count() > 0:
-                        email_filled = await self._human_type_field(locator, self.email, "이메일")
-                        if email_filled:
+                        await locator.click()
+                        await page.wait_for_timeout(random.randint(300, 600))
+                        await locator.fill(self.email)
+                        await page.wait_for_timeout(200)
+                        val = await locator.input_value()
+                        if val:
+                            logger.info(f"이메일 입력 완료: '{val[:25]}...'")
+                            email_filled = True
                             break
                 except Exception as e:
                     logger.debug(f"이메일 셀렉터 {sel} 실패: {e}")
@@ -462,78 +478,8 @@ class TikTokShopScraper:
                 await page.screenshot(path=f"{self.data_dir}/debug_email_fail.png")
                 return False
 
-            # ============================================================
-            # 2단계 로그인: 이메일 먼저 → Continue → 비밀번호
-            # TikTok webmssdk가 봇 감지하여 양 필드 동시 입력을 차단할 수 있음
-            # ============================================================
-            await page.wait_for_timeout(random.randint(500, 1200))
-
-            # fill()로 이메일 재확인 (React 호환)
-            for sel in email_selectors:
-                try:
-                    loc = target.locator(sel).first if login_frame else page.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.fill(self.email)
-                        await page.wait_for_timeout(200)
-                        val = await loc.input_value()
-                        logger.info(f"이메일 fill() 확인: '{val[:25] if val else ''}'")
-                        break
-                except Exception:
-                    pass
-
-            await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
-
-            # 네트워크 + 콘솔 모니터링 설정
-            network_requests = []
-            console_errors = []
-            def on_request(request):
-                if request.method == "POST" or any(k in request.url for k in ["login", "auth", "passport", "sso", "captcha", "verify"]):
-                    network_requests.append(f"REQ: {request.method} {request.url[:120]}")
-            def on_response(response):
-                if response.request.method == "POST" or any(k in response.url for k in ["login", "auth", "passport", "sso", "captcha", "verify"]):
-                    network_requests.append(f"RES: {response.status} {response.url[:120]}")
-            def on_console(msg):
-                if msg.type in ("error", "warning"):
-                    console_errors.append(f"[{msg.type}] {msg.text[:150]}")
-            page.on("request", on_request)
-            page.on("response", on_response)
-            page.on("console", on_console)
-
-            # 1단계: Continue 클릭 (이메일만)
-            logger.info("=== 1단계: 이메일만 입력 후 Continue ===")
-            continue_btn = page.locator('button:has-text("Continue"):visible').first
-            if await continue_btn.count() > 0:
-                is_disabled = await continue_btn.evaluate("el => el.disabled")
-                logger.info(f"Continue 버튼: disabled={is_disabled}")
-                await continue_btn.hover()
-                await page.wait_for_timeout(random.randint(300, 600))
-                await continue_btn.click()
-                logger.info("Continue 버튼 클릭 완료 (이메일만)")
-            else:
-                logger.info("Continue 버튼 미발견 - Enter 키 사용")
-                await page.keyboard.press("Enter")
-
-            # 네비게이션 대기
-            await page.wait_for_timeout(5000)
-            post_email_url = page.url
-            logger.info(f"이메일 제출 후 URL: {post_email_url}")
-            if network_requests:
-                for nr in network_requests[:15]:
-                    logger.info(f"네트워크(1단계): {nr}")
-            else:
-                logger.info("네트워크(1단계): POST 요청 없음!")
-            if console_errors:
-                for ce in console_errors[:5]:
-                    logger.info(f"콘솔(1단계): {ce}")
-
-            await page.screenshot(path=f"{self.data_dir}/debug_after_email_continue.png")
-
-            # 페이지 변화 확인
-            page_text = await page.evaluate("() => document.body?.innerText?.substring(0, 500) || ''")
-            logger.info(f"이메일 Continue 후 페이지: {page_text[:200]}")
-
-            # 2단계: 비밀번호 입력 (페이지가 바뀌었든 안 바뀌었든)
-            logger.info("=== 2단계: 비밀번호 입력 ===")
+            # === 비밀번호 입력 ===
+            await page.wait_for_timeout(random.randint(500, 1000))
             pw_selectors = [
                 'input[type="password"]:visible',
                 'input[name="password"]:visible',
@@ -543,80 +489,60 @@ class TikTokShopScraper:
                 try:
                     locator = target.locator(sel).first if login_frame else page.locator(sel).first
                     if await locator.count() > 0:
+                        await locator.click()
+                        await page.wait_for_timeout(random.randint(300, 600))
                         await locator.fill(self.password)
                         await page.wait_for_timeout(200)
                         val = await locator.input_value()
-                        logger.info(f"비밀번호 fill() 결과: 길이={len(val) if val else 0}")
-                        pw_filled = True
-                        break
+                        if val:
+                            logger.info(f"비밀번호 입력 완료 (길이={len(val)})")
+                            pw_filled = True
+                            break
                 except Exception as e:
                     logger.debug(f"비밀번호 셀렉터 {sel} 실패: {e}")
-
-            if not pw_filled:
-                # execCommand로 재시도
-                for sel in pw_selectors:
-                    try:
-                        locator = target.locator(sel).first if login_frame else page.locator(sel).first
-                        if await locator.count() > 0:
-                            pw_filled = await self._human_type_field(locator, self.password, "비밀번호")
-                            if pw_filled:
-                                break
-                    except Exception:
-                        pass
 
             if not pw_filled:
                 logger.error("비밀번호 입력 실패")
                 return False
 
-            await page.wait_for_timeout(random.randint(500, 1000))
+            await page.wait_for_timeout(random.randint(800, 1500))
+            await page.screenshot(path=f"{self.data_dir}/debug_before_continue.png")
 
-            # 네트워크 로그 초기화
-            network_requests.clear()
-            console_errors.clear()
+            # 네트워크 모니터링 설정
+            network_requests = []
+            def on_request(request):
+                if request.method == "POST":
+                    network_requests.append(f"REQ: {request.method} {request.url[:120]}")
+            def on_response(response):
+                if response.request.method == "POST":
+                    network_requests.append(f"RES: {response.status} {response.url[:120]}")
+            page.on("request", on_request)
+            page.on("response", on_response)
 
-            # 2단계: Continue/Login 버튼 클릭
-            submit_btn = None
-            for btn_text in ["Log in", "Log In", "Login", "Continue", "Submit"]:
-                btn = page.locator(f'button:has-text("{btn_text}"):visible').first
-                if await btn.count() > 0:
-                    submit_btn = btn
-                    logger.info(f"제출 버튼 발견: '{btn_text}'")
-                    break
-
-            if submit_btn:
-                await submit_btn.hover()
+            # === Continue 버튼 클릭 ===
+            continue_btn = page.locator('button:has-text("Continue"):visible').first
+            if await continue_btn.count() > 0:
+                await continue_btn.hover()
                 await page.wait_for_timeout(random.randint(200, 500))
-                await submit_btn.click()
-                logger.info("제출 버튼 클릭 완료")
+                await continue_btn.click()
+                logger.info("Continue 버튼 클릭 완료")
             else:
-                # 비밀번호 필드에서 Enter
-                for sel in pw_selectors:
-                    loc = page.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.click()
-                        break
                 await page.keyboard.press("Enter")
                 logger.info("Enter 키로 제출")
 
-            # 제출 후 대기 + 네트워크 로그
             await page.wait_for_timeout(5000)
             submit_url = page.url
-            logger.info(f"최종 제출 후 URL: {submit_url}")
-            if network_requests:
-                for nr in network_requests[:15]:
-                    logger.info(f"네트워크(2단계): {nr}")
-            else:
-                logger.info("네트워크(2단계): POST 요청 없음!")
-            if console_errors:
-                for ce in console_errors[:5]:
-                    logger.info(f"콘솔(2단계): {ce}")
+            logger.info(f"제출 후 URL: {submit_url}")
+            for nr in network_requests[:10]:
+                logger.info(f"네트워크: {nr}")
+            if not network_requests:
+                logger.info("네트워크: POST 요청 없음")
 
             await page.screenshot(path=f"{self.data_dir}/debug_after_continue.png")
 
             # 이벤트 리스너 정리
             page.remove_listener("request", on_request)
             page.remove_listener("response", on_response)
-            page.remove_listener("console", on_console)
 
             # 에러 메시지 확인
             try:
