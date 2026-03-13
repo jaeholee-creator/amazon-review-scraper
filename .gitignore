@@ -75,3 +75,12 @@ node_modules/
 scrapers/shopee-seller-centre/auth-state.json
 scrapers/shopee-seller-centre/service-account.json
 scrapers/shopee-seller-centre/output/
+
+# OMC planning files
+.omc/
+
+# Browser profiles
+data/tiktok/browser_profile*/
+
+# Analysis docs (auto-generated)
+TIKTOK_SCRAPER_ANALYSIS.md
