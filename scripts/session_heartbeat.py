@@ -113,6 +113,22 @@ def _kill_stale_chrome():
 atexit.register(_kill_stale_chrome)
 
 
+def _notify_session_expired() -> None:
+    """세션 만료 시 Slack 알림 전송."""
+    try:
+        from src.slack_notifier import SlackNotifier
+        notifier = SlackNotifier()
+        notifier.send_error_alert(
+            "🔑 TikTok Seller Center 쿠키 만료!\n"
+            "자동 로그인이 불가능합니다 (webmssdk 봇 탐지).\n"
+            "수동으로 쿠키를 갱신해주세요:\n"
+            "  python -m scrapers.tiktok.refresh_cookies"
+        )
+        logger.info("Slack 알림 전송 완료")
+    except Exception as e:
+        logger.warning(f"Slack 알림 전송 실패: {e}")
+
+
 async def heartbeat():
     """Seller Center를 방문하여 세션 쿠키를 갱신합니다."""
     logger.info("=" * 60)
@@ -139,6 +155,7 @@ async def heartbeat():
     use_headless = not bool(display)
 
     pw = await async_playwright().start()
+    ctx = None
 
     try:
         ctx = await _launch_context(pw, PROFILE_DIR, use_headless)
@@ -164,7 +181,8 @@ async def heartbeat():
             logger.warning(f"세션 만료됨 - 재로그인 필요. URL: {current_url}")
             await ctx.close()
             await pw.stop()
-            return False
+            _notify_session_expired()
+            return None  # None = 세션 만료 (False = 기술적 오류와 구분)
 
         # 쿠키 갱신 저장
         # NOTE: Rating 페이지 방문은 scraper에서 처리.
@@ -183,11 +201,11 @@ async def heartbeat():
 
     except Exception as e:
         logger.error(f"Heartbeat 실패: {e}")
-        try:
-            if 'ctx' in dir():
+        if ctx is not None:
+            try:
                 await ctx.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         try:
             await pw.stop()
         except Exception:
@@ -196,9 +214,13 @@ async def heartbeat():
 
 
 if __name__ == "__main__":
-    success = asyncio.run(heartbeat())
-    if success:
+    result = asyncio.run(heartbeat())
+    if result is True:
         logger.info("Heartbeat 성공")
+        sys.exit(0)
+    elif result is None:
+        logger.warning("세션 만료 - 수동 쿠키 갱신 필요 (Slack 알림 전송됨)")
+        sys.exit(2)  # 세션 만료: DAG에서 tiktok_reviews 차단
     else:
-        logger.warning("Heartbeat 실패 - 세션 만료 가능")
-        sys.exit(1)
+        logger.error("Heartbeat 기술적 오류")
+        sys.exit(1)  # 기술적 오류

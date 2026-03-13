@@ -4,11 +4,11 @@ Review Scraper DAG - TikTok 전용 (테스트/운영)
 현재 상태: TikTok만 실행. Amazon/Shopee/Biodance는 TikTok 안정화 후 재추가 예정.
 
 TikTok 흐름:
-  xvfb_ensure → tiktok_reviews
+  xvfb_ensure → tiktok_keepalive → tiktok_reviews
 
-  - tiktok_heartbeat 제거: heartbeat가 rating 페이지를 방문하면 guard token
-    rate-limit으로 이후 scraper가 실패함. scraper 내부 _ensure_logged_in이
-    세션 확인 역할을 대신함.
+  - tiktok_keepalive: 매일 homepage만 방문해 쿠키 mtime 갱신 (30일 만료 카운터 리셋).
+    세션 만료 시 Slack 알림 + exit(2) → tiktok_reviews 차단.
+    ⚠ Rating 페이지 방문 금지: guard token rate-limit으로 scraper 실패 유발.
   - profile_cleanup 제거: tiktok_reviews 태스크 내부에서 처리.
   - retries=0: 테스트 중 실패 원인을 즉시 확인하기 위함.
 """
@@ -74,7 +74,31 @@ with DAG(
     )
 
     # =========================================================================
-    # Task 2: TikTok 리뷰 수집
+    # Task 2: TikTok 세션 Keepalive
+    #
+    # - homepage만 방문해 쿠키 mtime 갱신 (30일 만료 카운터 리셋)
+    # - 세션 만료 시: Slack 알림 + exit(2) → tiktok_reviews 차단
+    # - ⚠ rating 페이지 방문 절대 금지: guard token rate-limit 유발
+    # =========================================================================
+    tiktok_keepalive = BashOperator(
+        task_id='tiktok_keepalive',
+        bash_command=(
+            'pkill -9 chromium 2>/dev/null || true; '
+            'sleep 1; '
+            f'{VENV_ACTIVATE} && cd {SCRAPER_DIR} && python scripts/session_heartbeat.py'
+        ),
+        env={
+            **common_env,
+            'DISPLAY': ':99',
+            'TIKTOK_DATA_DIR': 'data/tiktok',
+        },
+        append_env=True,
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
+    )
+
+    # =========================================================================
+    # Task 3: TikTok 리뷰 수집
     #
     # - Chrome 잔여 프로세스 및 잠금 파일 정리
     # - tiktok_daily_scraper.py 실행
@@ -116,4 +140,4 @@ with DAG(
     # =========================================================================
     # Task 의존성
     # =========================================================================
-    xvfb_ensure >> tiktok_reviews
+    xvfb_ensure >> tiktok_keepalive >> tiktok_reviews
