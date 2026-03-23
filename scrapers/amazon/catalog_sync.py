@@ -21,13 +21,14 @@ import sys
 logger = logging.getLogger(__name__)
 
 # BIODANCE 브랜드 스토어 ALL 페이지
-# 브랜드 검색 필터(rh=p_4:BIODANCE)는 ~19개만 반환하므로 스토어 페이지 사용
+# US: https://www.amazon.com/stores/BIODANCE/page/6651FCB6-7282-4AEA-8BA5-324130851A71 메인
+# UK: https://www.amazon.co.uk/stores/BIODANCE/page/A4C2F38D-867D-4604-B80D-C3CD0ADB6A5F 메인
 BRAND_STORE_URLS = {
     "us": "https://www.amazon.com/stores/page/C83E0E56-BFF3-4557-B3F8-7059A9C69CDF",
-    "uk": "https://www.amazon.co.uk/stores/page/C83E0E56-BFF3-4557-B3F8-7059A9C69CDF",
+    "uk": "https://www.amazon.co.uk/stores/page/A914CB68-5FCF-41B9-9B6B-FA907E6FEB9D",
 }
 
-# UK 스토어가 없을 경우 폴백 (브랜드 필터 없는 일반 검색)
+# 스토어 페이지 실패 시 폴백 (브랜드 필터 없는 일반 검색)
 BRAND_SEARCH_FALLBACK = {
     "us": "https://www.amazon.com/s?k=BIODANCE&s=review-rank",
     "uk": "https://www.amazon.co.uk/s?k=BIODANCE&s=review-rank",
@@ -98,12 +99,6 @@ async def _extract_asins_from_page(page) -> list[dict]:
 async def discover_asins_from_store(region: str) -> list[dict]:
     """
     브랜드 스토어 ALL 페이지에서 ASIN 수집
-
-    Args:
-        region: "us" 또는 "uk"
-
-    Returns:
-        [{"asin": "B0XXXXXX", "name": "...", "url": "..."}, ...]
     """
     from playwright.async_api import async_playwright
 
@@ -132,7 +127,6 @@ async def discover_asins_from_store(region: str) -> list[dict]:
             await page.goto(store_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
-            # 페이지 끝까지 스크롤 (lazy-load 상품 로딩)
             prev_height = 0
             for scroll_attempt in range(20):
                 await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
@@ -155,7 +149,6 @@ async def discover_asins_from_store(region: str) -> list[dict]:
         finally:
             await browser.close()
 
-    # 중복 제거 및 URL 추가, 비브랜드 항목 필터링
     seen: set[str] = set()
     unique: list[dict] = []
     skipped: list[str] = []
@@ -183,7 +176,6 @@ async def discover_asins_from_store(region: str) -> list[dict]:
 async def discover_asins_from_search(region: str, max_pages: int = 15) -> list[dict]:
     """
     폴백: Amazon 브랜드 검색에서 ASIN 수집 (스토어 페이지 실패 시)
-    브랜드 필터(rh=p_4) 없이 일반 검색을 사용하여 더 많은 상품 포함
     """
     from playwright.async_api import async_playwright
 
