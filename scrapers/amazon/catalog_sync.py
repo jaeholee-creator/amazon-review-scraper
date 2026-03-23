@@ -1,8 +1,11 @@
 """
 Amazon 상품 카탈로그 동기화
 
-Amazon 브랜드 검색 페이지를 Playwright로 크롤링하여
+BIODANCE 브랜드 스토어 ALL 페이지를 Playwright로 크롤링하여
 신규 상품을 감지하고 products.csv를 자동으로 업데이트합니다.
+
+브랜드 검색 필터(rh=p_4:BIODANCE) 대신 브랜드 스토어 ALL 페이지를 사용합니다.
+→ 브랜드 검색은 약 19개만 반환하지만, 스토어 페이지는 모든 상품을 포함합니다.
 
 사용법:
     python scrapers/amazon/catalog_sync.py us
@@ -17,10 +20,17 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-# 브랜드 검색 URL (brand filter: rh=p_4%3ABIODANCE)
-BRAND_SEARCH_URLS = {
-    "us": "https://www.amazon.com/s?k=BIODANCE&rh=p_4%3ABIODANCE&s=review-rank",
-    "uk": "https://www.amazon.co.uk/s?k=BIODANCE&rh=p_4%3ABIODANCE&s=review-rank",
+# BIODANCE 브랜드 스토어 ALL 페이지
+# 브랜드 검색 필터(rh=p_4:BIODANCE)는 ~19개만 반환하므로 스토어 페이지 사용
+BRAND_STORE_URLS = {
+    "us": "https://www.amazon.com/stores/page/C83E0E56-BFF3-4557-B3F8-7059A9C69CDF",
+    "uk": "https://www.amazon.co.uk/stores/page/C83E0E56-BFF3-4557-B3F8-7059A9C69CDF",
+}
+
+# UK 스토어가 없을 경우 폴백 (브랜드 필터 없는 일반 검색)
+BRAND_SEARCH_FALLBACK = {
+    "us": "https://www.amazon.com/s?k=BIODANCE&s=review-rank",
+    "uk": "https://www.amazon.co.uk/s?k=BIODANCE&s=review-rank",
 }
 
 PRODUCTS_CSV = {
@@ -31,24 +41,76 @@ PRODUCTS_CSV = {
 US_CSV_FIELDNAMES = ["asin", "name", "price", "rating", "review_count", "url"]
 UK_CSV_FIELDNAMES = ["asin", "name"]
 
+EXTRACT_ASINS_JS = """
+() => {
+    const seen = new Set();
+    const results = [];
 
-async def discover_asins(region: str = "us", max_pages: int = 15) -> list[dict]:
+    // 이미지가 있는 컨테이너 안의 /dp/ASIN 링크만 추출 (실제 상품 카드)
+    // Amazon Business Card 등 내비게이션 링크는 이미지가 없으므로 제외됨
+    document.querySelectorAll('a[href]').forEach(function(a) {
+        const href = a.getAttribute('href') || '';
+        const match = href.match(/\\/dp\\/([A-Z0-9]{10})(?:[\\/\\?]|$)/);
+        if (!match) return;
+        const asin = match[1];
+        if (seen.has(asin)) return;
+
+        // 상위 8개 노드 안에 img[src]가 있어야 실제 상품 카드로 간주
+        let node = a;
+        let hasImage = false;
+        for (let i = 0; i < 8; i++) {
+            node = node.parentElement;
+            if (!node) break;
+            if (node.querySelector('img[src]')) {
+                hasImage = true;
+                break;
+            }
+        }
+        if (!hasImage) return;
+
+        seen.add(asin);
+        const name = (a.title || a.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 200);
+        results.push({ asin: asin, name: name });
+    });
+
+    // data-asin 속성 보완 (위에서 못 잡은 경우 — 이미지 있는 컨테이너만)
+    document.querySelectorAll('[data-asin]').forEach(function(el) {
+        const asin = el.getAttribute('data-asin');
+        if (!asin || asin.length !== 10) return;
+        if (seen.has(asin)) return;
+        if (!el.querySelector('img[src]')) return;
+        seen.add(asin);
+        const nameEl = el.querySelector('h2, [class*="title"], [class*="name"], a[title]');
+        const name = nameEl ? (nameEl.title || nameEl.textContent || '').trim().slice(0, 200) : '';
+        results.push({ asin: asin, name: name });
+    });
+
+    return results;
+}
+"""
+
+
+async def _extract_asins_from_page(page) -> list[dict]:
+    """현재 페이지에서 ASIN + 상품명 추출 (이미지 있는 실제 상품만)"""
+    return await page.evaluate(EXTRACT_ASINS_JS)
+
+
+async def discover_asins_from_store(region: str) -> list[dict]:
     """
-    Amazon 브랜드 검색 페이지에서 ASIN 수집
+    브랜드 스토어 ALL 페이지에서 ASIN 수집
 
     Args:
         region: "us" 또는 "uk"
-        max_pages: 최대 페이지 수 (브랜드당 상품이 많지 않으므로 15페이지면 충분)
 
     Returns:
-        [{"asin": "B0XXXXXX", "name": "...", "price": "...", "url": "..."}, ...]
+        [{"asin": "B0XXXXXX", "name": "...", "url": "..."}, ...]
     """
     from playwright.async_api import async_playwright
 
-    search_url = BRAND_SEARCH_URLS.get(region)
-    if not search_url:
-        raise ValueError(f"지원하지 않는 region: {region}")
-
+    store_url = BRAND_STORE_URLS.get(region)
+    if not store_url:
+        logger.error(f"[{region.upper()}] 지원하지 않는 region: {region}")
+        return []
     base_url = "https://www.amazon.com" if region == "us" else "https://www.amazon.co.uk"
     discovered: list[dict] = []
 
@@ -66,65 +128,127 @@ async def discover_asins(region: str = "us", max_pages: int = 15) -> list[dict]:
         page = await context.new_page()
 
         try:
-            logger.info(f"[{region.upper()}] 브랜드 검색 페이지 접속: {search_url}")
+            logger.info(f"[{region.upper()}] 브랜드 스토어 ALL 페이지 접속: {store_url}")
+            await page.goto(store_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            # 페이지 끝까지 스크롤 (lazy-load 상품 로딩)
+            prev_height = 0
+            for scroll_attempt in range(20):
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+                await page.wait_for_timeout(1500)
+                current_height = await page.evaluate("document.body.scrollHeight")
+                if current_height == prev_height:
+                    logger.info(f"[{region.upper()}] 스크롤 완료 (attempt {scroll_attempt + 1})")
+                    break
+                prev_height = current_height
+
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1000)
+
+            items = await _extract_asins_from_page(page)
+            logger.info(f"[{region.upper()}] 브랜드 스토어에서 {len(items)}개 ASIN 발견")
+            discovered.extend(items)
+
+        except Exception as e:
+            logger.error(f"[{region.upper()}] 스토어 페이지 크롤링 오류: {e}")
+        finally:
+            await browser.close()
+
+    # 중복 제거 및 URL 추가, 비브랜드 항목 필터링
+    seen: set[str] = set()
+    unique: list[dict] = []
+    skipped: list[str] = []
+    for item in discovered:
+        asin = item["asin"]
+        if asin in seen:
+            continue
+        name = item.get("name", "")
+        if name and "biodance" not in name.lower() and "biod" not in name.lower():
+            skipped.append(f"{asin}: {name[:60]}")
+            continue
+        seen.add(asin)
+        item["url"] = f"{base_url}/dp/{asin}"
+        unique.append(item)
+
+    if skipped:
+        logger.info(f"[{region.upper()}] 비브랜드 항목 {len(skipped)}개 제외:")
+        for s in skipped:
+            logger.info(f"  - {s}")
+
+    logger.info(f"[{region.upper()}] 총 {len(unique)}개 고유 상품 (스토어 페이지)")
+    return unique
+
+
+async def discover_asins_from_search(region: str, max_pages: int = 15) -> list[dict]:
+    """
+    폴백: Amazon 브랜드 검색에서 ASIN 수집 (스토어 페이지 실패 시)
+    브랜드 필터(rh=p_4) 없이 일반 검색을 사용하여 더 많은 상품 포함
+    """
+    from playwright.async_api import async_playwright
+
+    search_url = BRAND_SEARCH_FALLBACK.get(region)
+    if not search_url:
+        logger.error(f"[{region.upper()}] 지원하지 않는 region: {region}")
+        return []
+    base_url = "https://www.amazon.com" if region == "us" else "https://www.amazon.co.uk"
+    discovered: list[dict] = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/121.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+        )
+        page = await context.new_page()
+
+        try:
+            logger.info(f"[{region.upper()}] 폴백 브랜드 검색 접속: {search_url}")
             await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(2000)
 
             for page_num in range(1, max_pages + 1):
-                # data-asin 속성에서 ASIN + 상품명 추출
                 items = await page.evaluate("""
                     () => {
                         const results = [];
                         const containers = document.querySelectorAll(
                             '[data-component-type="s-search-result"][data-asin]'
                         );
-
-                        containers.forEach(container => {
+                        containers.forEach(function(container) {
                             const asin = container.getAttribute('data-asin');
                             if (!asin || asin.length < 10) return;
-
-                            // 상품명 (h2 안의 span 또는 a)
                             const nameEl = container.querySelector('h2 .a-text-normal, h2 span');
                             const name = nameEl ? nameEl.textContent.trim() : '';
-
-                            // 가격
-                            const priceEl = container.querySelector(
-                                '.a-price[data-a-size] .a-offscreen, .a-price .a-offscreen'
-                            );
+                            const priceEl = container.querySelector('.a-price .a-offscreen');
                             const price = priceEl ? priceEl.textContent.trim() : '';
-
-                            results.push({ asin, name, price });
+                            results.push({ asin: asin, name: name, price: price });
                         });
-
                         return results;
                     }
                 """)
 
                 valid = [i for i in items if i.get("asin") and len(i["asin"]) >= 10]
                 discovered.extend(valid)
-                logger.info(
-                    f"[{region.upper()}] Page {page_num}: {len(valid)}개 발견 "
-                    f"(누적: {len(discovered)}개)"
-                )
+                logger.info(f"[{region.upper()}] Search page {page_num}: {len(valid)}개 (누적: {len(discovered)}개)")
 
-                # 다음 페이지 버튼 확인
                 next_btn = await page.query_selector(
-                    "a.s-pagination-next:not(.s-pagination-disabled), "
-                    "li.a-last a"
+                    "a.s-pagination-next:not(.s-pagination-disabled), li.a-last a"
                 )
                 if not next_btn:
-                    logger.info(f"[{region.upper()}] 마지막 페이지 도달 (page {page_num})")
                     break
-
                 await next_btn.click()
                 await page.wait_for_timeout(2500)
 
         except Exception as e:
-            logger.error(f"[{region.upper()}] 페이지 크롤링 오류: {e}")
+            logger.error(f"[{region.upper()}] 검색 페이지 크롤링 오류: {e}")
         finally:
             await browser.close()
 
-    # 중복 제거 (ASIN 기준)
     seen: set[str] = set()
     unique: list[dict] = []
     for item in discovered:
@@ -134,8 +258,20 @@ async def discover_asins(region: str = "us", max_pages: int = 15) -> list[dict]:
             item["url"] = f"{base_url}/dp/{asin}"
             unique.append(item)
 
-    logger.info(f"[{region.upper()}] 총 {len(unique)}개 고유 상품 발견")
+    logger.info(f"[{region.upper()}] 총 {len(unique)}개 고유 상품 (검색 폴백)")
     return unique
+
+
+async def discover_asins(region: str = "us", max_pages: int = 15) -> list[dict]:
+    """
+    ASIN 수집 메인 함수.
+    브랜드 스토어 ALL 페이지 시도 → 실패 시 브랜드 검색 폴백
+    """
+    result = await discover_asins_from_store(region)
+    if len(result) < 5:
+        logger.warning(f"[{region.upper()}] 스토어 페이지에서 {len(result)}개만 발견. 브랜드 검색으로 폴백...")
+        result = await discover_asins_from_search(region, max_pages)
+    return result
 
 
 def load_csv(csv_path: str) -> tuple[list[dict], set[str]]:
@@ -166,41 +302,27 @@ def save_csv(rows: list[dict], csv_path: str, fieldnames: list[str]) -> None:
 
 async def sync_products(region: str = "us") -> dict:
     """
-    Amazon 브랜드 검색에서 상품 목록을 가져와 products.csv와 동기화.
-
-    - 신규 ASIN → CSV에 추가
-    - 삭제/비활성 ASIN → 경고 로그만 (CSV 유지, 수동 확인 필요)
-
-    Returns:
-        {"added": [asin, ...], "removed": [asin, ...], "total": int}
+    브랜드 스토어 ALL 페이지에서 상품 목록을 가져와 products.csv와 동기화.
     """
     csv_path = PRODUCTS_CSV.get(region, f"config/products_{region}.csv")
     fieldnames = US_CSV_FIELDNAMES if region == "us" else UK_CSV_FIELDNAMES
 
     logger.info(f"[{region.upper()}] ===== Amazon 상품 카탈로그 동기화 =====")
 
-    # 1. Amazon에서 현재 활성 상품 수집
     discovered = await discover_asins(region)
     current_asins = {item["asin"] for item in discovered}
 
     if not current_asins:
-        logger.warning(
-            f"[{region.upper()}] Amazon에서 상품을 가져오지 못했습니다. "
-            f"기존 CSV를 그대로 유지합니다."
-        )
+        logger.warning(f"[{region.upper()}] Amazon에서 상품을 가져오지 못했습니다. 기존 CSV를 그대로 유지합니다.")
         return {"added": [], "removed": [], "total": 0}
 
-    # 2. 기존 CSV 로드
     existing_rows, existing_asins = load_csv(csv_path)
     existing_map = {row["asin"]: row for row in existing_rows}
 
-    # 3. 신규 / 삭제 감지
     added_asins = current_asins - existing_asins
     removed_asins = existing_asins - current_asins
-
     added_items = [item for item in discovered if item["asin"] in added_asins]
 
-    # 4. CSV 업데이트 (신규 추가)
     if added_items:
         all_rows = list(existing_rows)
         for item in added_items:
@@ -215,37 +337,22 @@ async def sync_products(region: str = "us") -> dict:
                     "url": item.get("url", f"https://www.amazon.com/dp/{asin}"),
                 })
             else:
-                all_rows.append({
-                    "asin": asin,
-                    "name": item.get("name", ""),
-                })
+                all_rows.append({"asin": asin, "name": item.get("name", "")})
 
         save_csv(all_rows, csv_path, fieldnames)
-        logger.info(
-            f"[{region.upper()}] CSV 업데이트 완료: "
-            f"{len(added_items)}개 신규 추가 → {csv_path}"
-        )
+        logger.info(f"[{region.upper()}] CSV 업데이트 완료: {len(added_items)}개 신규 추가 → {csv_path}")
         for item in added_items:
             logger.info(f"  + {item['asin']}: {item.get('name', '')[:60]}")
     else:
         logger.info(f"[{region.upper()}] 신규 상품 없음 (기존 CSV 유지)")
 
-    # 5. 삭제/비활성 상품 경고 (CSV에서는 제거하지 않음)
     if removed_asins:
-        logger.warning(
-            f"[{region.upper()}] Amazon 검색에 더 이상 노출되지 않는 상품 "
-            f"{len(removed_asins)}개 (CSV 유지, 수동 확인 필요):"
-        )
+        logger.warning(f"[{region.upper()}] Amazon 스토어에 더 이상 노출되지 않는 상품 {len(removed_asins)}개 (CSV 유지, 수동 확인 필요):")
         for asin in removed_asins:
             name = existing_map.get(asin, {}).get("name", "")
             logger.warning(f"  ? {asin}: {name}")
 
-    logger.info(
-        f"[{region.upper()}] 동기화 완료 — "
-        f"Amazon: {len(current_asins)}개, "
-        f"추가: {len(added_items)}개, "
-        f"미노출: {len(removed_asins)}개"
-    )
+    logger.info(f"[{region.upper()}] 동기화 완료 — 스토어: {len(current_asins)}개, 추가: {len(added_items)}개, 미노출: {len(removed_asins)}개")
 
     return {
         "added": [item["asin"] for item in added_items],
@@ -266,7 +373,7 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Amazon 상품 동기화 완료 ({region.upper()})")
     print(f"{'='*60}")
-    print(f"  Amazon 현재 상품 수: {result['total']}")
+    print(f"  스토어 현재 상품 수: {result['total']}")
     print(f"  신규 추가: {len(result['added'])}개")
     if result["added"]:
         for asin in result["added"]:
