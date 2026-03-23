@@ -226,6 +226,10 @@ async def main():
     appended = publish_result.get("appended_reviews", 0)
     status = scrape_result.get("status", "unknown")
 
+    # 0개 수집 + success → partial (스피너 지속 또는 해당 기간 리뷰 없음)
+    if status == "success" and total_reviews == 0:
+        status = "partial"
+
     logger.info("\n" + "=" * 80)
     logger.info("최종 요약")
     logger.info("=" * 80)
@@ -241,6 +245,8 @@ async def main():
         slack = SlackNotifier()
 
         error_msg = scrape_result.get('error', '')
+        if status == 'partial' and not error_msg:
+            error_msg = '리뷰 미수집 (페이지 로딩 실패 또는 해당 기간 리뷰 없음)'
 
         slack_results = [{
             'product_name': f'US (+{appended} new)',

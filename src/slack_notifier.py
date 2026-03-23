@@ -58,7 +58,7 @@ class SlackNotifier:
         partial_count = sum(1 for r in results if r.get('status') == 'partial')
         failed_count = sum(1 for r in results if r.get('status') == 'failed')
 
-        status_emoji = '✅' if failed_count == 0 else '⚠️' if success_count > 0 else '❌'
+        status_emoji = '✅' if (failed_count == 0 and partial_count == 0) else '⚠️' if failed_count == 0 else '❌'
 
         minutes = int(total_time_seconds // 60)
         seconds = int(total_time_seconds % 60)

@@ -110,11 +110,9 @@ class TikTokShopScraper:
         launch_kwargs = dict(
             headless=use_headless,
             viewport={"width": 1440, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/134.0.0.0 Safari/537.36"
-            ),
+            # user_agent removed - Patchright 기본 UA 사용 (커스텀 UA는 TikTok guard 감지 트리거)
+
+
             locale="en-US",
             timezone_id="America/New_York",
             args=[
@@ -1307,6 +1305,77 @@ class TikTokShopScraper:
     # Review Scraping
     # =========================================================================
 
+    async def _wait_for_rating_content(self, timeout_sec: int = 45) -> bool:
+        """Rating 페이지의 콘텐츠가 로딩될 때까지 대기.
+
+        로딩 스피너가 사라지고 ratingListItem 또는 빈 상태 메시지가 나타날 때까지 폴링.
+        45초 초과 시 페이지를 한 번 리로드 후 추가 20초 대기.
+
+        Returns:
+            True: 콘텐츠 로딩 완료 (리뷰 있음 또는 빈 상태)
+            False: 타임아웃 (여전히 로딩 중)
+        """
+        page = self._page
+        import time as _time
+
+        async def _content_ready() -> bool:
+            info = await page.evaluate("""
+                () => {
+                    const items = document.querySelectorAll('[class*="ratingListItem"]');
+                    const bodyText = document.body ? document.body.innerText.trim() : '';
+                    const totalEls = document.querySelectorAll('*').length;
+                    // 빈 상태 메시지 (No data / No reviews 등)
+                    const emptyState = document.querySelector(
+                        '[class*="emptyState"], [class*="empty-state"], '
+                        + '[class*="noData"], [class*="no-data"]'
+                    );
+                    return {
+                        reviewCount: items.length,
+                        bodyLen: bodyText.length,
+                        totalEls: totalEls,
+                        hasEmptyState: !!emptyState,
+                    };
+                }
+            """)
+            ready = (
+                info['reviewCount'] > 0
+                or info['hasEmptyState']
+                or (info['bodyLen'] > 100 and info['totalEls'] > 300)
+            )
+            return ready, info
+
+        logger.info("Rating 페이지 콘텐츠 로딩 대기 중...")
+        deadline = _time.time() + timeout_sec
+
+        while _time.time() < deadline:
+            ready, info = await _content_ready()
+            if ready:
+                logger.info(
+                    f"콘텐츠 로딩 완료: reviews={info['reviewCount']}, "
+                    f"bodyLen={info['bodyLen']}, els={info['totalEls']}"
+                )
+                return True
+            await page.wait_for_timeout(2000)
+
+        # 타임아웃 → 페이지 리로드 1회 후 추가 대기
+        logger.warning(f"{timeout_sec}초 내 콘텐츠 미로딩 → 페이지 리로드 후 재시도")
+        try:
+            await page.goto(self.RATING_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+        except Exception as e:
+            logger.warning(f"리로드 실패: {e}")
+
+        reload_deadline = _time.time() + 20
+        while _time.time() < reload_deadline:
+            ready, info = await _content_ready()
+            if ready:
+                logger.info(f"리로드 후 콘텐츠 로딩 완료: reviews={info['reviewCount']}")
+                return True
+            await page.wait_for_timeout(2000)
+
+        logger.error("콘텐츠 로딩 최종 실패 (스피너 지속 또는 빈 페이지)")
+        return False
+
     async def scrape_reviews(
         self,
         start_date: date,
@@ -1378,8 +1447,11 @@ class TikTokShopScraper:
 
         for page_num in range(1, max_pages + 1):
             try:
-                # 리뷰 요소 대기
-                await page.wait_for_timeout(2000)
+                # 콘텐츠 로딩 완료 대기 (스피너 → 리뷰 목록 or 빈 상태)
+                if page_num == 1:
+                    await self._wait_for_rating_content()
+                else:
+                    await page.wait_for_timeout(2000)
 
                 # HTML에서 리뷰 파싱
                 reviews = await self._parse_reviews_from_page()
@@ -1503,14 +1575,13 @@ class TikTokShopScraper:
         body_preview = debug_info.get('bodyTextPreview', '')[:500]
         logger.info(f"[DOM 디버깅] Body 미리보기: {body_preview}")
 
-        # HTML 파일 저장 (최초 1회)
+        # HTML 파일 저장 (항상 최신으로 덮어쓰기)
         try:
             html_path = os.path.join(self.data_dir, "rating_page.html")
-            if not os.path.exists(html_path):
-                full_html = await page.evaluate("() => document.documentElement.outerHTML")
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(full_html)
-                logger.info(f"[DOM 디버깅] HTML 저장: {html_path} ({len(full_html)} chars)")
+            full_html = await page.evaluate("() => document.documentElement.outerHTML")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(full_html)
+            logger.info(f"[DOM 디버깅] HTML 저장: {html_path} ({len(full_html)} chars)")
             # 스크린샷도 저장
             ss_path = os.path.join(self.data_dir, "debug_rating_current.png")
             await page.screenshot(path=ss_path, full_page=True)
