@@ -10,9 +10,11 @@ Usage:
     python daily_scraper.py --region all             # US + UK 순차 실행
     python daily_scraper.py --region uk --test       # UK 테스트 (10페이지)
     python daily_scraper.py --region us --limit 3    # US 3개만
+    python daily_scraper.py --region us --no-sync    # 상품 동기화 건너뜀
 """
 
 import asyncio
+import csv as csv_module
 import os
 import sys
 import time
@@ -65,6 +67,25 @@ def load_config(region: str) -> dict:
     }
 
 
+def _load_asins_from_csv(region: str) -> tuple[list[str], dict[str, str]]:
+    """products.csv에서 ASIN 목록을 직접 읽어 반환 (동기화 후 재로드용)."""
+    csv_path = f"config/products{'_uk' if region == 'uk' else ''}.csv"
+    asins: list[str] = []
+    names: dict[str, str] = {}
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            for row in csv_module.DictReader(f):
+                asin = row.get('asin', '').strip()
+                name = row.get('name', '').strip()
+                if asin:
+                    asins.append(asin)
+                    if name:
+                        names[asin] = name
+    except FileNotFoundError:
+        pass
+    return asins, names
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -78,6 +99,7 @@ async def main():
             region = sys.argv[idx + 1].lower()
 
     test_mode = '--test' in sys.argv
+    no_sync = '--no-sync' in sys.argv
     limit = None
     if '--limit' in sys.argv:
         idx = sys.argv.index('--limit')
@@ -90,13 +112,13 @@ async def main():
 
     if region == 'all':
         for r in ('us', 'uk'):
-            await run_region(r, test_mode, limit)
+            await run_region(r, test_mode, limit, no_sync)
         return
 
-    await run_region(region, test_mode, limit)
+    await run_region(region, test_mode, limit, no_sync)
 
 
-async def run_region(region: str, test_mode: bool, limit: int | None):
+async def run_region(region: str, test_mode: bool, limit: int | None, no_sync: bool = False):
     """단일 region 스크래핑 실행. Google Sheets를 단일 중복 체크 소스로 사용."""
     # 설정 로드
     cfg = load_config(region)
@@ -118,6 +140,50 @@ async def run_region(region: str, test_mode: bool, limit: int | None):
     print(f"   Products: {len(asin_list)}")
     print(f"   Mode: {'TEST' if test_mode else 'FULL'} (max {max_pages} pages)")
     print(f"{'='*60}")
+
+    # =========================================================================
+    # Step 0: 상품 카탈로그 동기화 (신규/삭제 상품 자동 감지)
+    #
+    # Amazon 브랜드 검색 페이지를 크롤링하여 현재 활성 상품 목록을 확인하고,
+    # 신규 ASIN을 products.csv에 추가합니다.
+    # - test_mode 또는 --no-sync 플래그로 건너뜀
+    # - SYNC_PRODUCTS=false 환경변수로도 비활성화 가능
+    # - 동기화 실패 시 기존 목록으로 계속 진행 (non-fatal)
+    # =========================================================================
+    should_sync = (
+        not test_mode
+        and not no_sync
+        and os.environ.get('SYNC_PRODUCTS', 'true').lower() != 'false'
+    )
+
+    if should_sync:
+        print("\n[Step 0] Syncing Amazon product catalog...")
+        try:
+            from scrapers.amazon.catalog_sync import sync_products
+            sync_result = await sync_products(region)
+            added = sync_result.get('added', [])
+            removed = sync_result.get('removed', [])
+            total = sync_result.get('total', 0)
+
+            if added:
+                print(f"   +{len(added)} new product(s) added to CSV: {added}")
+                # CSV가 업데이트됐으므로 ASIN 목록 재로드
+                fresh_asins, fresh_names = _load_asins_from_csv(region)
+                if fresh_asins:
+                    asin_list = fresh_asins[:limit] if limit else fresh_asins
+                    product_names = fresh_names
+                    print(f"   Product list reloaded: {len(asin_list)} products")
+            else:
+                print(f"   No new products (total active: {total})")
+
+            if removed:
+                print(f"   {len(removed)} product(s) no longer visible on Amazon (kept in CSV): {removed}")
+
+        except Exception as e:
+            print(f"   Catalog sync failed (non-fatal, continuing with existing list): {e}")
+    else:
+        reason = "test mode" if test_mode else ("--no-sync" if no_sync else "SYNC_PRODUCTS=false")
+        print(f"\n[Step 0] Skipping catalog sync ({reason})")
 
     # Publisher 타입 결정
     publisher_type = os.environ.get('PUBLISHER_TYPE', 'bigquery')
