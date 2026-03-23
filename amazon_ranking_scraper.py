@@ -28,26 +28,29 @@ BQ_DATASET = "jaeho"
 BQ_TABLE = "amazon_product_rankings"
 BQ_CREDENTIALS = "config/bigquery-service-account.json"
 
+# fmt: off
 CREATE_TABLE_DDL = f"""
 CREATE TABLE IF NOT EXISTS `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}` (
-    asin              STRING    NOT NULL,
-    region            STRING    NOT NULL,
-    product_name      STRING,
-    bsr_rank          INT64,
-    bsr_category      STRING,
-    bsr_category_url  STRING,
-    sub_ranks         STRING,
-    rating            FLOAT64,
-    review_count      INT64,
-    collected_at      TIMESTAMP NOT NULL,
-    collected_date    DATE      NOT NULL
+    asin             STRING    NOT NULL OPTIONS(description='Amazon Standard Identification Number (10자리 고유 상품 코드)'),
+    region           STRING    NOT NULL OPTIONS(description='수집 지역: us(미국) 또는 uk(영국)'),
+    product_name     STRING             OPTIONS(description='상품명 (products.csv 기준)'),
+    bsr_rank         INT64              OPTIONS(description='Best Sellers Rank 메인 순위 (낙을수록 높은 순위, 예: 6 = 전체 6위)'),
+    bsr_category     STRING             OPTIONS(description='BSR 메인 카테고리명 (예: Beauty & Personal Care)'),
+    bsr_category_url STRING             OPTIONS(description='BSR 메인 카테고리 베스트셀러 페이지 URL'),
+    sub_rank         INT64              OPTIONS(description='첫 번째 서브카테고리 내 BSR 순위 (예: 1 = 해당 서브카테고리 1위)'),
+    sub_category     STRING             OPTIONS(description='첫 번째 서브카테고리명 (예: Facial Masks, Facial Serums)'),
+    rating           FLOAT64            OPTIONS(description='고객 평점 (0.0 ~ 5.0 범위, 소수점 1자리)'),
+    review_count     INT64              OPTIONS(description='누적 리뷰 수 (해당 시점 전체 리뷰 총합)'),
+    collected_at     TIMESTAMP NOT NULL OPTIONS(description='수집 시각 (UTC 기준 ISO 8601)'),
+    collected_date   DATE      NOT NULL OPTIONS(description='수집 날짜 (파티션 키 — PARTITION BY collected_date)')
 )
 PARTITION BY collected_date
 OPTIONS (
-    description = 'Amazon 상품 BSR 순위 및 고객 평점 시간별 스냅샷 (US/UK)',
+    description = 'Amazon 상품 BSR 순위 및 고객 평점 시간별 스냅샷 (US/UK). 매시간 수집.',
     partition_expiration_days = 730
 )
 """
+# fmt: on
 
 
 def load_products(region: str) -> tuple[list[str], dict[str, str]]:
@@ -107,36 +110,39 @@ def insert_rankings(rows: list[dict]) -> int:
     temp_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}_tmp_{ts}"
 
     schema = [
-        bigquery.SchemaField("asin", "STRING"),
-        bigquery.SchemaField("region", "STRING"),
-        bigquery.SchemaField("product_name", "STRING"),
-        bigquery.SchemaField("bsr_rank", "INT64"),
-        bigquery.SchemaField("bsr_category", "STRING"),
+        bigquery.SchemaField("asin",             "STRING"),
+        bigquery.SchemaField("region",           "STRING"),
+        bigquery.SchemaField("product_name",     "STRING"),
+        bigquery.SchemaField("bsr_rank",         "INT64"),
+        bigquery.SchemaField("bsr_category",     "STRING"),
         bigquery.SchemaField("bsr_category_url", "STRING"),
-        bigquery.SchemaField("sub_ranks", "STRING"),
-        bigquery.SchemaField("rating", "FLOAT64"),
-        bigquery.SchemaField("review_count", "INT64"),
-        bigquery.SchemaField("collected_at", "TIMESTAMP"),
-        bigquery.SchemaField("collected_date", "DATE"),
+        bigquery.SchemaField("sub_rank",         "INT64"),
+        bigquery.SchemaField("sub_category",     "STRING"),
+        bigquery.SchemaField("rating",           "FLOAT64"),
+        bigquery.SchemaField("review_count",     "INT64"),
+        bigquery.SchemaField("collected_at",     "TIMESTAMP"),
+        bigquery.SchemaField("collected_date",   "DATE"),
     ]
 
     normalized = [
         {
-            "asin": r["asin"],
-            "region": r["region"],
-            "product_name": r.get("product_name", ""),
-            "bsr_rank": r.get("bsr_rank"),
-            "bsr_category": r.get("bsr_category", ""),
+            "asin":             r["asin"],
+            "region":           r["region"],
+            "product_name":     r.get("product_name", ""),
+            "bsr_rank":         r.get("bsr_rank"),
+            "bsr_category":     r.get("bsr_category", ""),
             "bsr_category_url": r.get("bsr_category_url", ""),
-            "sub_ranks": r.get("sub_ranks_json", "[]"),
-            "rating": r.get("rating"),
-            "review_count": r.get("review_count"),
-            "collected_at": r["collected_at"],
-            "collected_date": r["collected_date"],
+            "sub_rank":         r.get("sub_rank"),
+            "sub_category":     r.get("sub_category", ""),
+            "rating":           r.get("rating"),
+            "review_count":     r.get("review_count"),
+            "collected_at":     r["collected_at"],
+            "collected_date":   r["collected_date"],
         }
         for r in rows
     ]
 
+    # 1. 임시 테이블에 적재
     job_config = bigquery.LoadJobConfig(
         schema=schema,
         write_disposition="WRITE_TRUNCATE",
@@ -144,6 +150,7 @@ def insert_rankings(rows: list[dict]) -> int:
     client.load_table_from_json(normalized, temp_table, job_config=job_config).result()
     logger.info("임시 테이블 적재 완료: %d rows → %s", len(normalized), temp_table)
 
+    # 2. MERGE: 동일 asin+region+시간대 → UPDATE, 신규 → INSERT
     merge_sql = f"""
     MERGE `{full_table}` T
     USING `{temp_table}` S
@@ -155,18 +162,21 @@ def insert_rankings(rows: list[dict]) -> int:
         bsr_rank         = S.bsr_rank,
         bsr_category     = S.bsr_category,
         bsr_category_url = S.bsr_category_url,
-        sub_ranks        = S.sub_ranks,
+        sub_rank         = S.sub_rank,
+        sub_category     = S.sub_category,
         rating           = S.rating,
         review_count     = S.review_count,
         collected_at     = S.collected_at
     WHEN NOT MATCHED THEN INSERT (
         asin, region, product_name,
-        bsr_rank, bsr_category, bsr_category_url, sub_ranks,
+        bsr_rank, bsr_category, bsr_category_url,
+        sub_rank, sub_category,
         rating, review_count,
         collected_at, collected_date
     ) VALUES (
         S.asin, S.region, S.product_name,
-        S.bsr_rank, S.bsr_category, S.bsr_category_url, S.sub_ranks,
+        S.bsr_rank, S.bsr_category, S.bsr_category_url,
+        S.sub_rank, S.sub_category,
         S.rating, S.review_count,
         S.collected_at, S.collected_date
     )
@@ -174,6 +184,7 @@ def insert_rankings(rows: list[dict]) -> int:
     client.query(merge_sql).result()
     logger.info("MERGE 완료: %d rows", len(normalized))
 
+    # 3. 임시 테이블 삭제
     client.delete_table(temp_table, not_found_ok=True)
 
     return len(normalized)
@@ -209,10 +220,11 @@ async def run_region(region: str) -> int:
     print(f"[{region.upper()}] BSR 수집: {bsr_collected}/{len(asins)} 상품")
     for r in results[:5]:
         bsr = r.get("bsr_rank", "-")
+        sub = r.get("sub_rank", "-")
+        sub_cat = r.get("sub_category", "")[:25]
         rating = r.get("rating", "-")
-        reviews = r.get("review_count", "-")
-        name = r.get("product_name", r["asin"])[:40]
-        print(f"   {r['asin']}  BSR #{bsr}  {rating}★  {reviews:,} reviews  {name}" if isinstance(reviews, int) else f"   {r['asin']}  BSR #{bsr}  {rating}★  {name}")
+        name = r.get("product_name", r["asin"])[:35]
+        print(f"   {r['asin']}  BSR #{bsr}  sub #{sub} {sub_cat}  {rating}\u2605  {name}")
 
     return inserted
 

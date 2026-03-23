@@ -6,7 +6,6 @@ Playwright Chromium 기반, ARM64 호환.
 """
 
 import asyncio
-import json
 import logging
 import random
 from datetime import datetime, timezone
@@ -32,7 +31,8 @@ EXTRACT_RANKING_JS = """
         bsr_rank: null,
         bsr_category: null,
         bsr_category_url: null,
-        sub_ranks: [],
+        sub_rank: null,
+        sub_category: null,
         rating: null,
         review_count: null
     };
@@ -62,19 +62,16 @@ EXTRACT_RANKING_JS = """
             const bsrLinks = item.querySelectorAll('a[href*="bestsellers"]');
             if (bsrLinks.length > 0) result.bsr_category_url = bsrLinks[0].href;
 
-            // 서브 카테고리 순위 파싱
-            item.querySelectorAll('.zg_hrsr li').forEach(li => {
-                const text = li.textContent.trim().replace(/\\s+/g, ' ');
-                const link = li.querySelector('a');
+            // 첫 번째 서브카테고리 순위만 추출 (가장 구체적인 카테고리)
+            const firstSub = item.querySelector('.zg_hrsr li');
+            if (firstSub) {
+                const text = firstSub.textContent.trim().replace(/\\s+/g, ' ');
                 const rankMatch = text.match(/#([\\d,]+)\\s+in\\s+(.+)/);
                 if (rankMatch) {
-                    result.sub_ranks.push({
-                        rank: parseInt(rankMatch[1].replace(/,/g, '')),
-                        category: rankMatch[2].trim(),
-                        url: link ? link.href : ''
-                    });
+                    result.sub_rank = parseInt(rankMatch[1].replace(/,/g, ''));
+                    result.sub_category = rankMatch[2].trim();
                 }
-            });
+            }
             break;
         }
     }
@@ -145,11 +142,12 @@ async def scrape_all_rankings(
           {
             "asin": "B0B2RM68G2",
             "region": "us",
-            "product_name": "...",
+            "product_name": "Bio-Collagen Real Deep Mask",
             "bsr_rank": 6,
             "bsr_category": "Beauty & Personal Care",
             "bsr_category_url": "https://...",
-            "sub_ranks_json": '[{"rank":1,"category":"Facial Masks","url":"..."}]',
+            "sub_rank": 1,
+            "sub_category": "Facial Masks",
             "rating": 4.5,
             "review_count": 38570,
             "collected_at": "2026-03-23T14:00:00+00:00",
@@ -192,7 +190,8 @@ async def scrape_all_rankings(
                     "bsr_rank": data.get("bsr_rank"),
                     "bsr_category": data.get("bsr_category") or "",
                     "bsr_category_url": data.get("bsr_category_url") or "",
-                    "sub_ranks_json": json.dumps(data.get("sub_ranks", []), ensure_ascii=False),
+                    "sub_rank": data.get("sub_rank"),
+                    "sub_category": data.get("sub_category") or "",
                     "rating": data.get("rating"),
                     "review_count": data.get("review_count"),
                     "collected_at": collected_at,
